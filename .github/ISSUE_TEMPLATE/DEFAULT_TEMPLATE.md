@@ -1,5 +1,6 @@
 ---
 name: Задача разработки
+about: Шаблон задачи для Jmix-модулей и микросервисов
 title: "Краткое описание"
 labels: ["development", "backend", "jmix"]
 assignees: ""
