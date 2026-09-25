@@ -1,0 +1,388 @@
+name: 'Build with Kaniko in K8s'
+description: 'Builds Docker image using Kaniko pod inside Kubernetes'
+
+inputs:
+  image:
+    description: 'Base target image name (e.g. ghcr.io/thedevs-ru/thedevslk)'
+    required: true
+  tag:
+    description: 'Image tag'
+    required: true
+  namespace:
+    description: 'K8s namespace'
+    required: true
+  git_token:
+    description: 'GitHub Token for cloning repository context'
+    required: true
+  cache_pvc:
+    description: 'PVC volume name for project build cache'
+    required: true
+  docker_secret:
+    description: 'Secret name'
+    required: false
+    default: 'ghcr-secret'
+  repo:
+    description: 'Repository path for Kaniko context'
+    required: false
+    default: ''
+  branch:
+    description: 'Git branch to build'
+    required: false
+    default: ''
+  cache_repo:
+    description: 'Remote cache repository'
+    required: false
+    default: ''
+  build_timeout:
+    description: 'Build timeout in seconds'
+    required: false
+    default: '7200'
+  dockerfile:
+    description: 'Relative path to Dockerfile'
+    required: false
+    default: 'Dockerfile'
+  claude_cli_version:
+    description: 'Resolved Claude CLI version to pass via --build-arg=CLAUDE_CLI_VERSION'
+    required: false
+    default: ''
+  dockerhub_username:
+    description: 'Docker Hub username for authenticated pulls'
+    required: false
+    default: ''
+  dockerhub_token:
+    description: 'Docker Hub PAT for authenticated pulls'
+    required: false
+    default: ''
+  insecure:
+    description: 'Pass --insecure flag to Kaniko'
+    required: false
+    default: 'true'
+  insecure_pull:
+    description: 'Pass --insecure-pull flag to Kaniko'
+    required: false
+    default: 'true'
+  image_fs_extract_retry:
+    description: 'Number of retries for Kaniko image fs extract'
+    required: false
+    default: '0'
+
+runs:
+  using: "composite"
+  steps:
+    - name: Run Kaniko Build
+      shell: bash
+      env:
+        POD_NAME: kaniko-${{ github.run_id }}-${{ github.run_attempt }}
+        IMAGE: ${{ inputs.image }}
+        TAG: ${{ inputs.tag }}
+        NS: ${{ inputs.namespace }}
+        GIT_TOKEN: ${{ inputs.git_token }}
+        SECRET: ${{ inputs.docker_secret }}
+        CACHE_PVC: ${{ inputs.cache_pvc }}
+        INPUT_REPO: ${{ inputs.repo }}
+        INPUT_BRANCH: ${{ inputs.branch }}
+        INPUT_CACHE_REPO: ${{ inputs.cache_repo }}
+        INPUT_BUILD_TIMEOUT: ${{ inputs.build_timeout }}
+        INPUT_DOCKERFILE: ${{ inputs.dockerfile }}
+        CLAUDE_CLI_VERSION: ${{ inputs.claude_cli_version }}
+        DOCKERHUB_USERNAME: ${{ inputs.dockerhub_username }}
+        DOCKERHUB_TOKEN: ${{ inputs.dockerhub_token }}
+        INSECURE: ${{ inputs.insecure }}
+        INSECURE_PULL: ${{ inputs.insecure_pull }}
+        IMAGE_FS_EXTRACT_RETRY: ${{ inputs.image_fs_extract_retry }}
+        CACHEBUST: ${{ github.run_id }}-${{ github.run_attempt }}
+        CALLER_REPO: ${{ github.repository }}
+        CALLER_REF: ${{ github.ref_name }}
+      run: |
+        set +e
+        IMAGE_FULL="${IMAGE}:${TAG}"
+        CACHE_REPO="${INPUT_CACHE_REPO:-${IMAGE}/cache}"
+        BUILD_TIMEOUT="${INPUT_BUILD_TIMEOUT:-7200}"
+        DOCKERFILE="${INPUT_DOCKERFILE:-Dockerfile}"
+
+        if [ -n "$INPUT_REPO" ]; then
+          case "$INPUT_REPO" in
+            github.com/*) REPO="$INPUT_REPO" ;;
+            *) REPO="github.com/${INPUT_REPO}" ;;
+          esac
+          case "$REPO" in
+            *.git) ;;
+            *) REPO="${REPO}.git" ;;
+          esac
+        else
+          REPO="github.com/${CALLER_REPO}.git"
+        fi
+
+        BRANCH="${INPUT_BRANCH:-${CALLER_REF}}"
+
+        DOCKERHUB_B64=""
+        if [ -n "$DOCKERHUB_USERNAME" ] && [ -n "$DOCKERHUB_TOKEN" ]; then
+          DOCKERHUB_B64=$(printf '%s:%s' "$DOCKERHUB_USERNAME" "$DOCKERHUB_TOKEN" | base64 -w0)
+        fi
+
+        MAX_ATTEMPTS=3
+        DEADLINE=$((BUILD_TIMEOUT + 600))
+        API_TIMEOUT=600
+        NOT_FOUND_LIMIT=5
+        TRANSIENT_RE='error resolving source|connection reset by peer|i/o timeout|TLS handshake timeout|unexpected EOF|no such host|temporary failure in name resolution|502 Bad Gateway|Evicted'
+        CLONE_NOISE_RE='^(Enumerating objects:|Counting objects:|Compressing objects:|Receiving objects:|Resolving deltas:|remote:)'
+
+        ATTEMPT=1
+        while [ "$ATTEMPT" -le "$MAX_ATTEMPTS" ]; do
+          POD="${POD_NAME}-a${ATTEMPT}"
+          PHASE_OUT="${RUNNER_TEMP:-/tmp}/kaniko-phase-${ATTEMPT}.out"
+          PHASE_ERR="${RUNNER_TEMP:-/tmp}/kaniko-phase-${ATTEMPT}.err"
+
+          echo "BUILD_ATTEMPT: $ATTEMPT/$MAX_ATTEMPTS"
+          kubectl -n "$NS" delete pod "$POD" --force --grace-period=0 --ignore-not-found --request-timeout=30s >/dev/null 2>&1
+          sleep 1
+
+          cat <<EOF > "${RUNNER_TEMP:-/tmp}/kaniko-pod-${ATTEMPT}.yaml"
+        apiVersion: v1
+        kind: Pod
+        metadata:
+          name: $POD
+          namespace: $NS
+          labels:
+            app: kaniko-builder
+        spec:
+          activeDeadlineSeconds: $DEADLINE
+          initContainers:
+          - name: merge-docker-config
+            image: busybox:1.36
+            command: ["sh", "-c"]
+            args:
+            - |
+              cp /secret-orig/.dockerconfigjson /docker-config/config.json 2>/dev/null || echo '{"auths":{}}' > /docker-config/config.json
+              if [ -n "\$DOCKERHUB_B64" ]; then
+                sed -i 's|"auths":{|"auths":{"https://index.docker.io/v1/":{"auth":"'"\$DOCKERHUB_B64"'"},|' /docker-config/config.json
+              fi
+            env:
+            - name: DOCKERHUB_B64
+              value: "${DOCKERHUB_B64}"
+            volumeMounts:
+            - name: secret-orig
+              mountPath: /secret-orig
+              readOnly: true
+            - name: docker-config
+              mountPath: /docker-config
+            resources:
+              requests:
+                memory: "32Mi"
+                cpu: "50m"
+              limits:
+                memory: "64Mi"
+                cpu: "100m"
+          containers:
+          - name: kaniko
+            image: gcr.io/kaniko-project/executor:v1.23.2
+            args:
+            - "--context=git://x-access-token:${GIT_TOKEN}@${REPO}#refs/heads/${BRANCH}"
+            - "--destination=${IMAGE_FULL}"
+            - "--dockerfile=${DOCKERFILE}"
+            - "--build-arg=CACHEBUST=${CACHEBUST}"
+        EOF
+
+          if [ -n "$CLAUDE_CLI_VERSION" ]; then
+            cat <<EOF >> "${RUNNER_TEMP:-/tmp}/kaniko-pod-${ATTEMPT}.yaml"
+            - "--build-arg=CLAUDE_CLI_VERSION=${CLAUDE_CLI_VERSION}"
+        EOF
+          fi
+
+          if [ "$INSECURE" = "true" ]; then
+            cat <<EOF >> "${RUNNER_TEMP:-/tmp}/kaniko-pod-${ATTEMPT}.yaml"
+            - "--insecure"
+        EOF
+          fi
+
+          if [ "$INSECURE_PULL" = "true" ]; then
+            cat <<EOF >> "${RUNNER_TEMP:-/tmp}/kaniko-pod-${ATTEMPT}.yaml"
+            - "--insecure-pull"
+        EOF
+          fi
+
+          if [ -n "$IMAGE_FS_EXTRACT_RETRY" ] && [ "$IMAGE_FS_EXTRACT_RETRY" -gt 0 ] 2>/dev/null; then
+            cat <<EOF >> "${RUNNER_TEMP:-/tmp}/kaniko-pod-${ATTEMPT}.yaml"
+            - "--image-fs-extract-retry=${IMAGE_FS_EXTRACT_RETRY}"
+        EOF
+          fi
+
+          cat <<EOF >> "${RUNNER_TEMP:-/tmp}/kaniko-pod-${ATTEMPT}.yaml"
+            - "--cache=true"
+            - "--cache-repo=${CACHE_REPO}"
+            - "--cache-ttl=168h"
+            resources:
+              requests:
+                memory: "2Gi"
+                cpu: "1000m"
+              limits:
+                memory: "8Gi"
+                cpu: "3000m"
+            volumeMounts:
+            - name: docker-config
+              mountPath: /kaniko/.docker
+            - name: shared-cache
+              mountPath: /root/.gradle/wrapper
+              subPath: gradle-wrapper
+            - name: shared-cache
+              mountPath: /root/.vaadin
+              subPath: vaadin-root-cache
+            - name: shared-cache
+              mountPath: /root/.gradle/nodejs
+              subPath: gradle-nodejs
+            - name: shared-cache
+              mountPath: /root/.npm
+              subPath: npm-cache
+            - name: project-cache
+              mountPath: /root/.gradle/caches
+          restartPolicy: Never
+          volumes:
+          - name: secret-orig
+            secret:
+              secretName: $SECRET
+          - name: docker-config
+            emptyDir: {}
+          - name: shared-cache
+            persistentVolumeClaim:
+              claimName: kaniko-cache
+          - name: project-cache
+            persistentVolumeClaim:
+              claimName: ${CACHE_PVC}
+        EOF
+
+          echo "BUILD_START: $IMAGE_FULL"
+          kubectl apply --request-timeout=30s -f "${RUNNER_TEMP:-/tmp}/kaniko-pod-${ATTEMPT}.yaml"
+          rm -f "${RUNNER_TEMP:-/tmp}/kaniko-pod-${ATTEMPT}.yaml"
+
+          timeout 300s sh -c 'until kubectl -n "'"$NS"'" wait --for=condition=Ready "pod/'"$POD"'" --timeout=60s --request-timeout=30s 2>/dev/null; do sleep 5; done' || true
+
+          PHASE="Running"
+          API_FAIL_SINCE=0
+          NOT_FOUND_FAILS=0
+          POD_GONE=0
+          API_EXHAUSTED=0
+          TIMED_OUT=0
+          SECONDS=0
+
+          while [ "$SECONDS" -lt "$BUILD_TIMEOUT" ] && [ "$PHASE" != "Succeeded" ] && [ "$PHASE" != "Failed" ]; do
+            sleep 3
+            kubectl -n "$NS" get pod "$POD" -o jsonpath='{.status.phase}' --request-timeout=30s >"$PHASE_OUT" 2>"$PHASE_ERR"
+            RC=$?
+            POLL_OUT=$(cat "$PHASE_OUT" 2>/dev/null)
+            POLL_ERR=$(cat "$PHASE_ERR" 2>/dev/null)
+
+            if [ "$RC" -eq 0 ] && [ -n "$POLL_OUT" ]; then
+              PHASE="$POLL_OUT"
+              API_FAIL_SINCE=0
+              NOT_FOUND_FAILS=0
+            elif [ "$RC" -eq 0 ]; then
+              API_FAIL_SINCE=0
+              NOT_FOUND_FAILS=0
+            elif printf '%s' "$POLL_ERR" | grep -F -q '(NotFound)'; then
+              API_FAIL_SINCE=0
+              NOT_FOUND_FAILS=$((NOT_FOUND_FAILS + 1))
+              echo "Pod $POD not found (attempt $NOT_FOUND_FAILS/$NOT_FOUND_LIMIT)..."
+              if [ "$NOT_FOUND_FAILS" -ge "$NOT_FOUND_LIMIT" ]; then
+                POD_GONE=1
+                PHASE="Failed"
+              fi
+            else
+              NOT_FOUND_FAILS=0
+              if [ "$API_FAIL_SINCE" -eq 0 ]; then
+                API_FAIL_SINCE=$SECONDS
+              fi
+              FAIL_ELAPSED=$((SECONDS - API_FAIL_SINCE))
+              ERR_SNIP=$(printf '%s' "$POLL_ERR" | tr '\n' ' ' | cut -c1-160)
+              echo "API unavailable for ${FAIL_ELAPSED}s (limit ${API_TIMEOUT}s): ${ERR_SNIP}"
+              if [ "$FAIL_ELAPSED" -ge "$API_TIMEOUT" ]; then
+                echo "BUILD_FAILED: kubernetes API unavailable for ${FAIL_ELAPSED}s"
+                API_EXHAUSTED=1
+                PHASE="Failed"
+              fi
+            fi
+          done
+
+          if [ "$PHASE" != "Succeeded" ] && [ "$PHASE" != "Failed" ]; then
+            echo "BUILD_FAILED: build timed out after ${SECONDS}s (limit ${BUILD_TIMEOUT}s)"
+            TIMED_OUT=1
+            PHASE="Failed"
+          fi
+
+          echo "BUILD_RESULT: $PHASE"
+
+          if [ "$PHASE" = "Succeeded" ]; then
+            kubectl -n "$NS" delete pod "$POD" --ignore-not-found --wait=false --request-timeout=30s >/dev/null 2>&1
+            rm -f "$PHASE_OUT" "$PHASE_ERR"
+            exit 0
+          fi
+
+          echo "=========================================="
+          echo "BUILD_FAILED"
+          echo "=========================================="
+          echo ""
+          echo "=== POD STATUS ==="
+          POD_YAML=""
+          for i in 1 2 3; do
+            POD_YAML=$(kubectl -n "$NS" get pod "$POD" -o yaml --request-timeout=120s 2>&1) && break
+            echo "Retry $i..." && sleep 5
+          done
+          printf '%s\n' "$POD_YAML" | grep -A 30 "status:"
+          POD_REASON=$(printf '%s\n' "$POD_YAML" | grep -E '^[[:space:]]*reason:' | head -5)
+          echo ""
+          echo "=== POD EVENTS ==="
+          for i in 1 2 3; do
+            kubectl -n "$NS" describe pod "$POD" --request-timeout=120s 2>&1 | grep -A 50 "Events:" && break
+            echo "Retry $i..." && sleep 5
+          done
+          echo ""
+          echo "=== CONTAINER LOGS ==="
+          LOGS=""
+          for i in 1 2 3; do
+            LOGS=$(kubectl -n "$NS" logs "$POD" --all-containers=true --tail=-1 --request-timeout=240s 2>&1) && break
+            echo "Retry $i..." && sleep 5
+          done
+          if [ -z "$LOGS" ]; then
+            echo "Failed to get logs after retries"
+          else
+            echo "--- error lines ---"
+            printf '%s\n' "$LOGS" | grep "rror"
+            echo "--- last 200 lines (git clone progress filtered) ---"
+            printf '%s\n' "$LOGS" | grep -Ev "$CLONE_NOISE_RE" | tail -200
+          fi
+          echo ""
+          echo "=========================================="
+
+          if [ "$POD_GONE" -eq 0 ]; then
+            kubectl -n "$NS" delete pod "$POD" --ignore-not-found --wait=false --request-timeout=30s >/dev/null 2>&1 || true
+          fi
+
+          rm -f "$PHASE_OUT" "$PHASE_ERR"
+
+          if [ "$POD_GONE" -eq 1 ]; then
+            echo "Build failed: pod was confirmed deleted externally"
+            exit 1
+          fi
+
+          if [ "$API_EXHAUSTED" -eq 1 ]; then
+            echo "Build failed: kubernetes API unavailable for ${FAIL_ELAPSED}s"
+            exit 1
+          fi
+
+          if [ "$TIMED_OUT" -eq 1 ]; then
+            echo "Build failed: build timed out after ${SECONDS}s"
+            exit 1
+          fi
+
+          if [ "$ATTEMPT" -lt "$MAX_ATTEMPTS" ] && printf '%s\n%s\n' "$LOGS" "$POD_REASON" | grep -qEi "$TRANSIENT_RE"; then
+            BACKOFF=10
+            [ "$ATTEMPT" -eq 2 ] && BACKOFF=30
+            echo "Transient failure detected — retrying in ${BACKOFF}s"
+            sleep "$BACKOFF"
+            ATTEMPT=$((ATTEMPT + 1))
+            continue
+          fi
+
+          exit 1
+        done
+
+        exit 1
