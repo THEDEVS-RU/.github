@@ -137,7 +137,10 @@ runs:
           kubectl -n "$NS" delete pod "$POD" --force --grace-period=0 --ignore-not-found --request-timeout=30s >/dev/null 2>&1
           sleep 1
 
-          cat <<EOF > "${RUNNER_TEMP:-/tmp}/kaniko-pod-${ATTEMPT}.yaml"
+          echo "BUILD_START: $IMAGE_FULL"
+          APPLY_OUT=$(
+            {
+              cat <<EOF
         apiVersion: v1
         kind: Pod
         metadata:
@@ -182,32 +185,27 @@ runs:
             - "--dockerfile=${DOCKERFILE}"
             - "--build-arg=CACHEBUST=${CACHEBUST}"
         EOF
-
-          if [ -n "$CLAUDE_CLI_VERSION" ]; then
-            cat <<EOF >> "${RUNNER_TEMP:-/tmp}/kaniko-pod-${ATTEMPT}.yaml"
+              if [ -n "$CLAUDE_CLI_VERSION" ]; then
+                cat <<EOF
             - "--build-arg=CLAUDE_CLI_VERSION=${CLAUDE_CLI_VERSION}"
         EOF
-          fi
-
-          if [ "$INSECURE" = "true" ]; then
-            cat <<EOF >> "${RUNNER_TEMP:-/tmp}/kaniko-pod-${ATTEMPT}.yaml"
+              fi
+              if [ "$INSECURE" = "true" ]; then
+                cat <<EOF
             - "--insecure"
         EOF
-          fi
-
-          if [ "$INSECURE_PULL" = "true" ]; then
-            cat <<EOF >> "${RUNNER_TEMP:-/tmp}/kaniko-pod-${ATTEMPT}.yaml"
+              fi
+              if [ "$INSECURE_PULL" = "true" ]; then
+                cat <<EOF
             - "--insecure-pull"
         EOF
-          fi
-
-          if [ -n "$IMAGE_FS_EXTRACT_RETRY" ] && [ "$IMAGE_FS_EXTRACT_RETRY" -gt 0 ] 2>/dev/null; then
-            cat <<EOF >> "${RUNNER_TEMP:-/tmp}/kaniko-pod-${ATTEMPT}.yaml"
+              fi
+              if [ -n "$IMAGE_FS_EXTRACT_RETRY" ] && [ "$IMAGE_FS_EXTRACT_RETRY" -gt 0 ] 2>/dev/null; then
+                cat <<EOF
             - "--image-fs-extract-retry=${IMAGE_FS_EXTRACT_RETRY}"
         EOF
-          fi
-
-          cat <<EOF >> "${RUNNER_TEMP:-/tmp}/kaniko-pod-${ATTEMPT}.yaml"
+              fi
+              cat <<EOF
             - "--cache=true"
             - "--cache-repo=${CACHE_REPO}"
             - "--cache-ttl=168h"
@@ -249,10 +247,23 @@ runs:
             persistentVolumeClaim:
               claimName: ${CACHE_PVC}
         EOF
+            } | kubectl apply --request-timeout=30s -f - 2>&1
+          )
+          APPLY_RC=$?
+          printf '%s\n' "$APPLY_OUT"
 
-          echo "BUILD_START: $IMAGE_FULL"
-          kubectl apply --request-timeout=30s -f "${RUNNER_TEMP:-/tmp}/kaniko-pod-${ATTEMPT}.yaml"
-          rm -f "${RUNNER_TEMP:-/tmp}/kaniko-pod-${ATTEMPT}.yaml"
+          if [ "$APPLY_RC" -ne 0 ]; then
+            if [ "$ATTEMPT" -lt "$MAX_ATTEMPTS" ]; then
+              BACKOFF=10
+              [ "$ATTEMPT" -eq 2 ] && BACKOFF=30
+              echo "Transient apply failure detected — retrying in ${BACKOFF}s"
+              sleep "$BACKOFF"
+              ATTEMPT=$((ATTEMPT + 1))
+              continue
+            fi
+            echo "BUILD_FAILED: kubectl apply failed: $(printf '%s' "$APPLY_OUT" | tr '\n' ' ' | cut -c1-200)"
+            exit 1
+          fi
 
           timeout 300s sh -c 'until kubectl -n "'"$NS"'" wait --for=condition=Ready "pod/'"$POD"'" --timeout=60s --request-timeout=30s 2>/dev/null; do sleep 5; done' || true
 
