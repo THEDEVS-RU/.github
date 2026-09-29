@@ -6,7 +6,7 @@ inputs:
     description: "Action to perform: 'environments' (matrix resolution) or 'guard' (standalone Prod Guard)"
     required: true
   input_environment:
-    description: 'Target environment passed via workflow inputs (e.g. ${{ inputs.environment }})'
+    description: 'Target environment passed via workflow inputs (e.g. inputs.environment)'
     required: false
     default: ''
   default_environment:
@@ -18,11 +18,11 @@ inputs:
     required: false
     default: 'false'
   prod_environments:
-    description: 'JSON array string of production environments (e.g. ${{ vars.PROD_ENVIRONMENTS }})'
+    description: 'JSON array string of production environments (e.g. vars.PROD_ENVIRONMENTS)'
     required: false
     default: ''
   environment:
-    description: 'Current target environment being checked (e.g. ${{ matrix.environment }})'
+    description: 'Current target environment being checked (e.g. matrix.environment)'
     required: false
     default: ''
   prod_guard:
