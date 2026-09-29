@@ -122,11 +122,11 @@ runs:
         echo "DEPLOY_OK: $DEPLOYED_IMAGE"
 
         case "$DEPLOYED_IMAGE" in
-          *":$TAG"*)
-            echo "Image tag matches expected :$TAG"
+          "$IMAGE:$TAG"|*":$TAG")
+            echo "Image tag matches expected :$TAG ($DEPLOYED_IMAGE)"
             ;;
           *)
-            echo "::error::Deployed image '$DEPLOYED_IMAGE' does not match expected tag ':$TAG'" >&2
+            echo "::error::Deployed image '$DEPLOYED_IMAGE' does not match expected image/tag '$IMAGE:$TAG'" >&2
             exit 1
             ;;
         esac
