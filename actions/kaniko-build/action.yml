@@ -171,7 +171,11 @@ runs:
             - |
               cp /secret-orig/.dockerconfigjson /docker-config/config.json 2>/dev/null || echo '{"auths":{}}' > /docker-config/config.json
               if [ -n "\$DOCKERHUB_B64" ]; then
-                sed -i 's|"auths":{|"auths":{"https://index.docker.io/v1/":{"auth":"'"\$DOCKERHUB_B64"'"},|' /docker-config/config.json
+                if grep -q '"auths":{}' /docker-config/config.json; then
+                  sed -i 's|"auths":{}|"auths":{"https://index.docker.io/v1/":{"auth":"'"\$DOCKERHUB_B64"'"}}|' /docker-config/config.json
+                else
+                  sed -i 's|"auths":{|"auths":{"https://index.docker.io/v1/":{"auth":"'"\$DOCKERHUB_B64"'"},|' /docker-config/config.json
+                fi
               fi
             env:
             - name: DOCKERHUB_B64
