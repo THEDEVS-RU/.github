@@ -75,7 +75,8 @@ runs:
         fi
 
         if [ "${#MISSING[@]}" -lt 4 ]; then
-          MISSING_STR=$(IFS=', '; echo "${MISSING[*]}")
+          MISSING_STR=$(printf '%s, ' "${MISSING[@]}")
+          MISSING_STR="${MISSING_STR%, }"
           echo "::error::Incomplete SSH configuration: missing ${MISSING_STR}"
           exit 1
         fi
