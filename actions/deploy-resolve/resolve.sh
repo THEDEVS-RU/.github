@@ -25,6 +25,16 @@ validate_prod_environments() {
   fi
 }
 
+validate_dev_environments() {
+  local dev_json="$1"
+  if [ -n "$dev_json" ]; then
+    if ! echo "$dev_json" | jq -e 'type == "array" and length > 0 and all(.[]; type == "string" and test("^[A-Za-z0-9._-]+\\z"))' >/dev/null 2>&1; then
+      echo "::error::dev_environments must be a valid non-empty JSON array of strings matching ^[A-Za-z0-9._-]+$ (e.g. [\"dev\", \"stage\"]). Got: $dev_json"
+      exit 1
+    fi
+  fi
+}
+
 check_env_is_prod() {
   local env_name="$1"
   local prod_json="$2"
@@ -44,6 +54,7 @@ if [ -z "$ACT" ]; then
 fi
 
 validate_prod_environments "${PROD_ENVS:-}"
+validate_dev_environments "${DEV_ENVS:-}"
 
 case "$ACT" in
   environments)
@@ -56,6 +67,8 @@ case "$ACT" in
         exit 1
       fi
       ENV_ARRAY=$(echo "$PROD_ENVS" | jq -c .)
+    elif [ -n "${DEV_ENVS:-}" ]; then
+      ENV_ARRAY=$(echo "$DEV_ENVS" | jq -c .)
     else
       DEF="${DEFAULT_ENV:-dev}"
       validate_env_name "$DEF" "default_environment"
