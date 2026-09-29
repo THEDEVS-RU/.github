@@ -18,6 +18,9 @@
 | `git_token` | GitHub токен для клонирования контекста репозитория в Kaniko | Да | — |
 | `cache_pvc` | Имя PVC-тома для кэша сборки конкретного проекта | Да | — |
 | `docker_secret` | Имя K8s-секрета с данными авторизации в реестре (тип `kubernetes.io/dockerconfigjson`) | Нет | `thedevs-registry-secret` |
+| `registry_token` | Токен или пароль для аутентификации в корпоративном реестре | Нет | `''` |
+| `registry_username` | Имя пользователя для корпоративного реестра | Нет | `'thedevsru'` |
+| `registry_server` | Хост корпоративного реестра | Нет | `'registry.thedevs.ru'` |
 | `repo` | Путь к репозиторию для контекста Kaniko (если пустой, берётся текущий репозиторий) | Нет | `''` |
 | `branch` | Git-ветка контекста сборки | Нет | `''` |
 | `cache_repo` | Репозиторий удаленного кэша слоев Kaniko | Нет | `''` |
@@ -40,7 +43,9 @@ SECRET_CHECK_ERR=$(kubectl -n "$NS" get secret "$SECRET" --request-timeout=15s 2
 
 ### Поведение проверки:
 1. **Секрет существует:** сборка запускается в штатном режиме, секрет монтируется с `optional: true`.
-2. **Секрет не найден (`NotFound`):** экшен немедленно завершает работу с `::error::Docker secret '$SECRET' specified but not found in namespace '$NS'` и кодом 1. Это предотвращает создание пода, который завис бы в статусе `ContainerCreating` из-за невозможности смонтировать несуществующий K8s-секрет.
+2. **Секрет не найден (`NotFound`):**
+   - Если передан непустой `registry_token`, отсутствие K8s-секрета не блокирует выполнение: экшен выводит предупреждение `::warning::Docker secret '$SECRET' not found in namespace '$NS', but registry_token is provided — proceeding with token auth` и продолжает сборку с аутентификацией по токену через init-контейнер `merge-docker-config`.
+   - Если `registry_token` не передан, экшен немедленно завершает работу с `::error::Docker secret '$SECRET' specified but not found in namespace '$NS'` и кодом 1. Это предотвращает создание пода, который завис бы в статусе `ContainerCreating` из-за невозможности смонтировать несуществующий K8s-секрет.
 3. **Отказ в доступе (`Forbidden`) или иная ошибка API/сети:** проверка носит рекомендательный характер. Экшен выводит предупреждение `::warning::Could not verify secret '$SECRET' in namespace '$NS' (proceeding with optional volume): $SECRET_CHECK_ERR` и продолжает сборку (секрет монтируется как `optional: true`).
 4. **Секрет не передан (`docker_secret: ''`):** проверка пропускается, вместо тома секрета под монтирует пустой каталог `emptyDir: {}`.
 
@@ -54,7 +59,23 @@ rules:
     verbs: ["get"]
 ```
 
-## Пример использования
+## Примеры использования
+
+### Сборка с аутентификацией через GitHub Secret (рекомендуется)
+
+```yaml
+- name: Build Docker Image
+  uses: THEDEVS-RU/.github/actions/kaniko-build@dev
+  with:
+    image: registry.thedevs.ru/thedevslk
+    tag: ${{ github.sha }}
+    namespace: ${{ vars.BUILD_NAMESPACE }}
+    git_token: ${{ secrets.GITHUB_TOKEN }}
+    cache_pvc: thedevslk-cache-pvc
+    registry_token: ${{ secrets.REGISTRY_TOKEN }}
+```
+
+### Сборка с аутентификацией через K8s-секрет
 
 ```yaml
 - name: Build Docker Image
