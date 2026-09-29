@@ -35,8 +35,6 @@ run_test() {
     export PROD_ENVS=""
     export TARGET_ENV=""
     export PROD_GUARD=""
-    export HAS_K8S_CONFIG=""
-    export HAS_SSH_KEY=""
     while [ $# -gt 0 ]; do
       export "$1"
       shift
@@ -118,29 +116,23 @@ run_test "9d. validate_env_name: newline in input_environment -> error" 1 "" \
 run_test "9e. validate_prod_environments: trailing newline in PROD_ENVIRONMENTS -> error" 1 "" \
   ACTION="environments" PROD_ENVS='["prod-1\n"]'
 
-# 10. target: has_k8s_config = true -> mode=k8s, is_prod=false
-run_test "10. target: has_k8s_config=true -> mode=k8s, is_prod=false" 0 $'is_prod=false\nmode=k8s' \
-  ACTION="target" TARGET_ENV="dev" HAS_K8S_CONFIG="true" HAS_SSH_KEY="false"
+# 10. guard: missing environment input -> error
+run_test "10. guard: missing environment -> error" 1 "" \
+  ACTION="guard" TARGET_ENV=""
 
-# 11. target: has_k8s_config = false, has_ssh_key = true -> mode=ssh, is_prod=false
-run_test "11. target: has_ssh_key=true -> mode=ssh, is_prod=false" 0 $'is_prod=false\nmode=ssh' \
-  ACTION="target" TARGET_ENV="dev" HAS_K8S_CONFIG="false" HAS_SSH_KEY="true"
+# 11. guard: invalid environment name -> error
+run_test "11. guard: invalid environment name -> error" 1 "" \
+  ACTION="guard" TARGET_ENV="prod;rm -rf /"
 
-# 12. target: both flags false -> error
-run_test "12. target: both flags false -> error" 1 "" \
-  ACTION="target" TARGET_ENV="dev" HAS_K8S_CONFIG="false" HAS_SSH_KEY="false"
+# 12. guard: non-prod environment -> success, is_prod=false
+run_test "12a. guard: non-prod env with prod_environments -> is_prod=false" 0 'is_prod=false' \
+  ACTION="guard" TARGET_ENV="dev" PROD_ENVS='["prod-1","prod-2"]'
+run_test "12b. guard: non-prod env without prod_environments -> is_prod=false" 0 'is_prod=false' \
+  ACTION="guard" TARGET_ENV="dev" PROD_ENVS=''
 
-# 13. target: prod env handling
-run_test "13a. target: prod env with prod_guard=true -> error" 1 "" \
-  ACTION="target" TARGET_ENV="prod-1" PROD_GUARD="true" PROD_ENVS='["prod-1","prod-2"]' HAS_K8S_CONFIG="true"
-run_test "13b. target: prod env with prod_guard=false -> mode=k8s, is_prod=true" 0 $'is_prod=true\nmode=k8s' \
-  ACTION="target" TARGET_ENV="prod-1" PROD_GUARD="false" PROD_ENVS='["prod-1","prod-2"]' HAS_K8S_CONFIG="true"
-
-# Standalone guard action
-run_test "14a. guard: non-prod env -> is_prod=false" 0 'is_prod=false' \
-  ACTION="guard" TARGET_ENV="dev" PROD_ENVS='["prod-1"]'
-run_test "14b. guard: prod env -> error and is_prod=true" 1 'is_prod=true' \
-  ACTION="guard" TARGET_ENV="prod-1" PROD_ENVS='["prod-1"]'
+# 13. guard: prod environment -> error, is_prod=true
+run_test "13. guard: prod env -> error and is_prod=true" 1 'is_prod=true' \
+  ACTION="guard" TARGET_ENV="prod-1" PROD_ENVS='["prod-1","prod-2"]'
 
 echo "=== Test Results: $PASSED / $TOTAL passed ($FAILED failed) ==="
 
