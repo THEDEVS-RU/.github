@@ -1,0 +1,68 @@
+name: 'Deploy Resolve'
+description: 'Composite action to resolve deployment matrix, enforce Prod Guard, and dynamically select deploy target mode (k8s vs ssh)'
+
+inputs:
+  action:
+    description: "Action to perform: 'environments' (matrix resolution), 'target' (deploy mode resolution with optional guard), or 'guard' (standalone Prod Guard)"
+    required: true
+  input_environment:
+    description: 'Target environment passed via workflow inputs (e.g. ${{ inputs.environment }})'
+    required: false
+    default: ''
+  default_environment:
+    description: "Default environment to fallback when input_environment is empty (default: 'dev')"
+    required: false
+    default: 'dev'
+  fallback_to_prod:
+    description: 'When true and input_environment is empty, use prod_environments array (for redeploy/release workflows)'
+    required: false
+    default: 'false'
+  prod_environments:
+    description: 'JSON array string of production environments (e.g. ${{ vars.PROD_ENVIRONMENTS }})'
+    required: false
+    default: ''
+  environment:
+    description: 'Current target environment being deployed (e.g. ${{ matrix.environment }})'
+    required: false
+    default: ''
+  prod_guard:
+    description: 'Whether to abort if target/resolved environment is a production environment (for build.yml)'
+    required: false
+    default: 'false'
+  has_k8s_config:
+    description: 'Boolean flag indicating whether K8s deploy config is available (e.g. ${{ secrets.DEPLOY_CONFIG_K8S != '' }})'
+    required: false
+    default: 'false'
+  has_ssh_key:
+    description: 'Boolean flag indicating whether SSH private key is available (e.g. ${{ secrets.SSH_PRIVATE_KEY != '' }})'
+    required: false
+    default: 'false'
+
+outputs:
+  environments:
+    description: 'JSON array string of resolved environments for job matrix strategy'
+    value: ${{ steps.resolve.outputs.environments }}
+  mode:
+    description: "Resolved deployment target mode: 'k8s' or 'ssh'"
+    value: ${{ steps.resolve.outputs.mode }}
+  is_prod:
+    description: "Whether the target environment is a production environment ('true' or 'false')"
+    value: ${{ steps.resolve.outputs.is_prod }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Resolve
+      id: resolve
+      shell: bash
+      env:
+        ACTION: ${{ inputs.action }}
+        INPUT_ENV: ${{ inputs.input_environment }}
+        DEFAULT_ENV: ${{ inputs.default_environment }}
+        FALLBACK_PROD: ${{ inputs.fallback_to_prod }}
+        PROD_ENVS: ${{ inputs.prod_environments }}
+        TARGET_ENV: ${{ inputs.environment }}
+        PROD_GUARD: ${{ inputs.prod_guard }}
+        HAS_K8S_CONFIG: ${{ inputs.has_k8s_config }}
+        HAS_SSH_KEY: ${{ inputs.has_ssh_key }}
+      run: bash "$GITHUB_ACTION_PATH/resolve.sh"

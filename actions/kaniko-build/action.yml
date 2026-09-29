@@ -3,7 +3,7 @@ description: 'Builds Docker image using Kaniko pod inside Kubernetes'
 
 inputs:
   image:
-    description: 'Base target image name (e.g. ghcr.io/thedevs-ru/thedevslk)'
+    description: 'Base target image name (e.g. registry.container-registry.svc.cluster.local:5000/thedevslk or registry.thedevs.ru/thedevslk)'
     required: true
   tag:
     description: 'Image tag'
@@ -18,9 +18,9 @@ inputs:
     description: 'PVC volume name for project build cache'
     required: true
   docker_secret:
-    description: 'Secret name'
+    description: 'Secret name with registry auth (type kubernetes.io/dockerconfigjson)'
     required: false
-    default: ''
+    default: 'thedevs-registry-secret'
   repo:
     description: 'Repository path for Kaniko context'
     required: false
