@@ -20,7 +20,7 @@ inputs:
   docker_secret:
     description: 'Secret name'
     required: false
-    default: 'ghcr-secret'
+    default: ''
   repo:
     description: 'Repository path for Kaniko context'
     required: false
@@ -127,6 +127,14 @@ runs:
         TRANSIENT_RE='error resolving source|connection reset by peer|i/o timeout|TLS handshake timeout|unexpected EOF|no such host|temporary failure in name resolution|502 Bad Gateway|Evicted'
         CLONE_NOISE_RE='^(Enumerating objects:|Counting objects:|Compressing objects:|Receiving objects:|Resolving deltas:|remote:)'
 
+        if [ -n "$SECRET" ]; then
+          echo "Verifying docker secret '$SECRET' in namespace '$NS'..."
+          if ! kubectl -n "$NS" get secret "$SECRET" --request-timeout=30s >/dev/null 2>&1; then
+            echo "::error::Docker secret '$SECRET' specified but not found in namespace '$NS'"
+            exit 1
+          fi
+        fi
+
         ATTEMPT=1
         while [ "$ATTEMPT" -le "$MAX_ATTEMPTS" ]; do
           POD="${POD_NAME}-a${ATTEMPT}"
@@ -136,6 +144,23 @@ runs:
           echo "BUILD_ATTEMPT: $ATTEMPT/$MAX_ATTEMPTS"
           kubectl -n "$NS" delete pod "$POD" --force --grace-period=0 --ignore-not-found --request-timeout=30s >/dev/null 2>&1
           sleep 1
+
+          SECRET_VOLUME_SECTION=""
+          if [ -n "$SECRET" ]; then
+            SECRET_VOLUME_SECTION=$(cat <<SEF
+          - name: secret-orig
+            secret:
+              secretName: $SECRET
+              optional: true
+SEF
+)
+          else
+            SECRET_VOLUME_SECTION=$(cat <<SEF
+          - name: secret-orig
+            emptyDir: {}
+SEF
+)
+          fi
 
           echo "BUILD_START: $IMAGE_FULL"
           APPLY_OUT=$(
@@ -235,9 +260,7 @@ runs:
               mountPath: /root/.gradle/caches
           restartPolicy: Never
           volumes:
-          - name: secret-orig
-            secret:
-              secretName: $SECRET
+${SECRET_VOLUME_SECTION}
           - name: docker-config
             emptyDir: {}
           - name: shared-cache
