@@ -39,6 +39,18 @@ inputs:
     description: 'Container name'
     required: false
     default: 'app'
+  registry_url:
+    description: 'Container registry URL'
+    required: false
+    default: 'registry.thedevs.ru'
+  registry_user:
+    description: 'Username for docker login'
+    required: false
+    default: ''
+  registry_token:
+    description: 'Token/password for docker login'
+    required: false
+    default: ''
   healthcheck_port:
     description: 'Port for readiness probe'
     required: false
@@ -51,6 +63,10 @@ inputs:
     description: 'Readiness probe timeout in seconds'
     required: false
     default: '300'
+  deploy_script:
+    description: 'Optional path to custom deploy.sh script (defaults to action bundled deploy.sh or compose_dir/deploy.sh)'
+    required: false
+    default: ''
 
 outputs:
   deployed_image:
@@ -75,9 +91,13 @@ runs:
         COMPOSE_DIR: ${{ inputs.compose_dir }}
         SERVICE_NAME: ${{ inputs.service_name }}
         CONTAINER_NAME: ${{ inputs.container_name }}
+        REGISTRY_URL: ${{ inputs.registry_url }}
+        REGISTRY_USER: ${{ inputs.registry_user }}
+        REGISTRY_TOKEN: ${{ inputs.registry_token }}
         HEALTHCHECK_PORT: ${{ inputs.healthcheck_port }}
         HEALTHCHECK_PATH: ${{ inputs.healthcheck_path }}
         HEALTHCHECK_TIMEOUT: ${{ inputs.healthcheck_timeout }}
+        INPUT_DEPLOY_SCRIPT: ${{ inputs.deploy_script }}
         ACTION_PATH: ${{ github.action_path }}
       run: |
         set -euo pipefail
@@ -99,9 +119,17 @@ runs:
           exit 1
         fi
 
-        DEPLOY_SCRIPT="${ACTION_PATH}/deploy.sh"
-        if [ ! -f "$DEPLOY_SCRIPT" ]; then
-          echo "::error::deploy.sh not found at: $DEPLOY_SCRIPT" >&2
+        DEPLOY_SCRIPT=""
+        if [ -n "${INPUT_DEPLOY_SCRIPT:-}" ] && [ -f "$INPUT_DEPLOY_SCRIPT" ]; then
+          DEPLOY_SCRIPT="$INPUT_DEPLOY_SCRIPT"
+        elif [ -f "${COMPOSE_DIR}/deploy.sh" ]; then
+          DEPLOY_SCRIPT="${COMPOSE_DIR}/deploy.sh"
+        elif [ -f "${ACTION_PATH}/deploy.sh" ]; then
+          DEPLOY_SCRIPT="${ACTION_PATH}/deploy.sh"
+        fi
+
+        if [ -z "$DEPLOY_SCRIPT" ] || [ ! -f "$DEPLOY_SCRIPT" ]; then
+          echo "::error::deploy.sh not found (checked input deploy_script, ${COMPOSE_DIR}/deploy.sh, and ${ACTION_PATH}/deploy.sh)" >&2
           exit 1
         fi
 
@@ -120,6 +148,11 @@ runs:
         echo "Connecting to $USER@$HOST:$PORT and ensuring $APP_DIR exists..."
         "${SSH_CMD[@]}" "mkdir -p '$APP_DIR'"
 
+        if [ -n "$REGISTRY_USER" ] && [ -n "$REGISTRY_TOKEN" ]; then
+          echo "Logging into $REGISTRY_URL as $REGISTRY_USER on remote host..."
+          printf '%s' "$REGISTRY_TOKEN" | "${SSH_CMD[@]}" "docker login '$REGISTRY_URL' -u '$REGISTRY_USER' --password-stdin"
+        fi
+
         echo "Copying docker-compose.yml from $COMPOSE_FILE to $APP_DIR..."
         "${SCP_CMD[@]}" "$COMPOSE_FILE" "$USER@$HOST:$APP_DIR/docker-compose.yml"
 
@@ -134,3 +167,13 @@ runs:
         DEPLOYED_IMAGE=$("${SSH_CMD[@]}" "docker inspect -f '{{.Config.Image}}' '$CONTAINER_NAME'" | tr -d '\r\n')
         echo "deployed_image=$DEPLOYED_IMAGE" >> "$GITHUB_OUTPUT"
         echo "Successfully deployed image: $DEPLOYED_IMAGE"
+
+        case "$DEPLOYED_IMAGE" in
+          *":$TAG"*)
+            echo "Image tag matches expected :$TAG"
+            ;;
+          *)
+            echo "::error::Deployed image '$DEPLOYED_IMAGE' does not match expected tag ':$TAG'" >&2
+            exit 1
+            ;;
+        esac

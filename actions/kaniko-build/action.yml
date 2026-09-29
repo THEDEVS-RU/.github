@@ -129,9 +129,14 @@ runs:
 
         if [ -n "$SECRET" ]; then
           echo "Verifying docker secret '$SECRET' in namespace '$NS'..."
-          if ! kubectl -n "$NS" get secret "$SECRET" --request-timeout=30s >/dev/null 2>&1; then
-            echo "::error::Docker secret '$SECRET' specified but not found in namespace '$NS'"
-            exit 1
+          SECRET_CHECK_ERR=$(kubectl -n "$NS" get secret "$SECRET" --request-timeout=15s 2>&1 >/dev/null || true)
+          if [ -n "$SECRET_CHECK_ERR" ]; then
+            if printf '%s' "$SECRET_CHECK_ERR" | grep -F -q 'NotFound'; then
+              echo "::error::Docker secret '$SECRET' specified but not found in namespace '$NS'"
+              exit 1
+            else
+              echo "::warning::Could not verify secret '$SECRET' in namespace '$NS' (proceeding with optional volume): $SECRET_CHECK_ERR"
+            fi
           fi
         fi
 
@@ -144,23 +149,6 @@ runs:
           echo "BUILD_ATTEMPT: $ATTEMPT/$MAX_ATTEMPTS"
           kubectl -n "$NS" delete pod "$POD" --force --grace-period=0 --ignore-not-found --request-timeout=30s >/dev/null 2>&1
           sleep 1
-
-          SECRET_VOLUME_SECTION=""
-          if [ -n "$SECRET" ]; then
-            SECRET_VOLUME_SECTION=$(cat <<SEF
-          - name: secret-orig
-            secret:
-              secretName: $SECRET
-              optional: true
-SEF
-)
-          else
-            SECRET_VOLUME_SECTION=$(cat <<SEF
-          - name: secret-orig
-            emptyDir: {}
-SEF
-)
-          fi
 
           echo "BUILD_START: $IMAGE_FULL"
           APPLY_OUT=$(
@@ -260,7 +248,21 @@ SEF
               mountPath: /root/.gradle/caches
           restartPolicy: Never
           volumes:
-${SECRET_VOLUME_SECTION}
+        EOF
+              if [ -n "$SECRET" ]; then
+                cat <<EOF
+          - name: secret-orig
+            secret:
+              secretName: $SECRET
+              optional: true
+        EOF
+              else
+                cat <<EOF
+          - name: secret-orig
+            emptyDir: {}
+        EOF
+              fi
+              cat <<EOF
           - name: docker-config
             emptyDir: {}
           - name: shared-cache
