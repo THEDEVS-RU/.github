@@ -67,6 +67,10 @@ inputs:
     description: 'Optional path to custom deploy.sh script (defaults to action bundled deploy.sh or compose_dir/deploy.sh)'
     required: false
     default: ''
+  sync_compose:
+    description: 'Whether to copy docker-compose.yml to remote app_dir (default: true)'
+    required: false
+    default: 'true'
 
 outputs:
   deployed_image:
@@ -98,6 +102,7 @@ runs:
         HEALTHCHECK_PATH: ${{ inputs.healthcheck_path }}
         HEALTHCHECK_TIMEOUT: ${{ inputs.healthcheck_timeout }}
         INPUT_DEPLOY_SCRIPT: ${{ inputs.deploy_script }}
+        SYNC_COMPOSE: ${{ inputs.sync_compose }}
         ACTION_PATH: ${{ github.action_path }}
       run: |
         set -euo pipefail
@@ -113,10 +118,13 @@ runs:
           fi
         done
 
+        SYNC_COMPOSE="${SYNC_COMPOSE:-true}"
         COMPOSE_FILE="${COMPOSE_DIR}/docker-compose.yml"
-        if [ ! -f "$COMPOSE_FILE" ]; then
-          echo "::error::docker-compose.yml not found at: $COMPOSE_FILE" >&2
-          exit 1
+        if [ "$SYNC_COMPOSE" = "true" ]; then
+          if [ ! -f "$COMPOSE_FILE" ]; then
+            echo "::error::docker-compose.yml not found at: $COMPOSE_FILE" >&2
+            exit 1
+          fi
         fi
 
         DEPLOY_SCRIPT=""
@@ -153,8 +161,12 @@ runs:
           printf '%s' "$REGISTRY_TOKEN" | "${SSH_CMD[@]}" "docker login '$REGISTRY_URL' -u '$REGISTRY_USER' --password-stdin"
         fi
 
-        echo "Copying docker-compose.yml from $COMPOSE_FILE to $APP_DIR..."
-        "${SCP_CMD[@]}" "$COMPOSE_FILE" "$USER@$HOST:$APP_DIR/docker-compose.yml"
+        if [ "$SYNC_COMPOSE" = "true" ]; then
+          echo "Copying docker-compose.yml from $COMPOSE_FILE to $APP_DIR..."
+          "${SCP_CMD[@]}" "$COMPOSE_FILE" "$USER@$HOST:$APP_DIR/docker-compose.yml"
+        else
+          echo "sync_compose is false: skipping copy of docker-compose.yml to remote host"
+        fi
 
         echo "Copying deploy.sh from $DEPLOY_SCRIPT to $APP_DIR..."
         "${SCP_CMD[@]}" "$DEPLOY_SCRIPT" "$USER@$HOST:$APP_DIR/deploy.sh"
