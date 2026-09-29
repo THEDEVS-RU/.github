@@ -72,7 +72,8 @@ rules:
     namespace: ${{ vars.BUILD_NAMESPACE }}
     git_token: ${{ secrets.GITHUB_TOKEN }}
     cache_pvc: thedevslk-cache-pvc
-    registry_token: ${{ secrets.REGISTRY_TOKEN }}
+    registry_username: ${{ secrets.REGISTRY_USERNAME }}
+    registry_token: ${{ secrets.REGISTRY_PASSWORD }}
 ```
 
 ### Сборка с аутентификацией через K8s-секрет
