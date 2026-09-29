@@ -1,0 +1,132 @@
+name: 'Deploy via SSH Compose'
+description: 'Deploy docker compose application over SSH with isolated keys'
+
+inputs:
+  host:
+    description: 'Target server host or IP'
+    required: true
+  port:
+    description: 'SSH port'
+    required: false
+    default: '22'
+  user:
+    description: 'SSH username'
+    required: true
+  key:
+    description: 'SSH private key'
+    required: true
+  known_hosts:
+    description: 'SSH known_hosts line'
+    required: true
+  image:
+    description: 'Full image name (without tag)'
+    required: true
+  tag:
+    description: 'Image release tag'
+    required: true
+  app_dir:
+    description: 'Target directory on server'
+    required: true
+  compose_dir:
+    description: 'Local directory containing docker-compose.yml and deploy.sh'
+    required: true
+  service_name:
+    description: 'Target Compose service name'
+    required: true
+  container_name:
+    description: 'Target container name'
+    required: true
+  registry_url:
+    description: 'Container registry URL'
+    required: false
+    default: 'registry.thedevs.ru'
+  registry_user:
+    description: 'Username for docker login'
+    required: false
+    default: ''
+  registry_token:
+    description: 'Token/password for docker login'
+    required: false
+    default: ''
+
+outputs:
+  deployed_image:
+    description: 'Full image reference of the deployed container'
+    value: ${{ steps.deploy.outputs.deployed_image }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: SSH Compose Deploy
+      id: deploy
+      shell: bash
+      env:
+        HOST: ${{ inputs.host }}
+        PORT: ${{ inputs.port }}
+        USER: ${{ inputs.user }}
+        KEY: ${{ inputs.key }}
+        KNOWN_HOSTS: ${{ inputs.known_hosts }}
+        IMAGE: ${{ inputs.image }}
+        TAG: ${{ inputs.tag }}
+        APP_DIR: ${{ inputs.app_dir }}
+        COMPOSE_DIR: ${{ inputs.compose_dir }}
+        SERVICE_NAME: ${{ inputs.service_name }}
+        CONTAINER_NAME: ${{ inputs.container_name }}
+        REGISTRY_URL: ${{ inputs.registry_url }}
+        REGISTRY_USER: ${{ inputs.registry_user }}
+        REGISTRY_TOKEN: ${{ inputs.registry_token }}
+      run: |
+        set -euo pipefail
+
+        for pair in "host:$HOST" "port:$PORT" "user:$USER" "key:$KEY" \
+                    "known_hosts:$KNOWN_HOSTS" "image:$IMAGE" "tag:$TAG" \
+                    "app_dir:$APP_DIR" "compose_dir:$COMPOSE_DIR" \
+                    "service_name:$SERVICE_NAME" "container_name:$CONTAINER_NAME"; do
+          input_name="${pair%%:*}"
+          input_value="${pair#*:}"
+          if [ -z "$input_value" ]; then
+            echo "::error::Input '$input_name' is empty" >&2
+            exit 1
+          fi
+        done
+
+        TMP_SSH_DIR=$(mktemp -d)
+        trap 'rm -rf "$TMP_SSH_DIR"' EXIT
+
+        printf '%s\n' "$KEY" > "$TMP_SSH_DIR/id_key"
+        chmod 0600 "$TMP_SSH_DIR/id_key"
+
+        printf '%s\n' "$KNOWN_HOSTS" > "$TMP_SSH_DIR/known_hosts"
+        chmod 0600 "$TMP_SSH_DIR/known_hosts"
+
+        SSH_CMD=(ssh -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$TMP_SSH_DIR/known_hosts" -i "$TMP_SSH_DIR/id_key" -p "$PORT" "$USER@$HOST")
+        SCP_CMD=(scp -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$TMP_SSH_DIR/known_hosts" -i "$TMP_SSH_DIR/id_key" -P "$PORT")
+
+        echo "Connecting to $USER@$HOST:$PORT..."
+        "${SSH_CMD[@]}" "mkdir -p '$APP_DIR'"
+
+        if [ -n "$REGISTRY_USER" ] && [ -n "$REGISTRY_TOKEN" ]; then
+          echo "Logging into $REGISTRY_URL as $REGISTRY_USER on remote host..."
+          printf '%s' "$REGISTRY_TOKEN" | "${SSH_CMD[@]}" "docker login '$REGISTRY_URL' -u '$REGISTRY_USER' --password-stdin"
+        fi
+
+        echo "Copying docker-compose.yml and deploy.sh from $COMPOSE_DIR to $APP_DIR..."
+        "${SCP_CMD[@]}" "$COMPOSE_DIR/docker-compose.yml" "$COMPOSE_DIR/deploy.sh" "$USER@$HOST:$APP_DIR/"
+
+        echo "Setting executable permissions and running deploy.sh..."
+        "${SSH_CMD[@]}" "chmod +x '$APP_DIR/deploy.sh' && APP_DIR='$APP_DIR' IMAGE_NAME='$IMAGE' SERVICE_NAME='$SERVICE_NAME' CONTAINER_NAME='$CONTAINER_NAME' '$APP_DIR/deploy.sh' '$TAG' '$IMAGE' '$CONTAINER_NAME' '$SERVICE_NAME'"
+
+        echo "Inspecting deployed image from container $CONTAINER_NAME..."
+        DEPLOYED_IMAGE=$("${SSH_CMD[@]}" "docker inspect -f '{{.Config.Image}}' '$CONTAINER_NAME'")
+        echo "deployed_image=$DEPLOYED_IMAGE" >> "$GITHUB_OUTPUT"
+        echo "DEPLOY_OK: $DEPLOYED_IMAGE"
+
+        case "$DEPLOYED_IMAGE" in
+          *":$TAG"*)
+            echo "Image tag matches expected :$TAG"
+            ;;
+          *)
+            echo "::error::Deployed image '$DEPLOYED_IMAGE' does not match expected tag ':$TAG'" >&2
+            exit 1
+            ;;
+        esac
