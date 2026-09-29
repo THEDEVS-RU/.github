@@ -1,0 +1,84 @@
+name: 'Resolve Deploy Target'
+description: 'Determines whether to deploy to Kubernetes or via SSH Compose based on available configuration'
+
+inputs:
+  deploy_config_k8s:
+    description: 'Kubernetes kubeconfig string (DEPLOY_CONFIG_K8S or KUBE_CONFIG)'
+    required: false
+    default: ''
+  ssh_host:
+    description: 'SSH server host or IP (vars.SSH_HOST)'
+    required: false
+    default: ''
+  ssh_user:
+    description: 'SSH username (vars.SSH_USER)'
+    required: false
+    default: ''
+  ssh_key:
+    description: 'SSH private key (secrets.SSH_PRIVATE_KEY or secrets.SSH_KEY)'
+    required: false
+    default: ''
+  ssh_known_hosts:
+    description: 'SSH known_hosts string (secrets.SSH_KNOWN_HOSTS)'
+    required: false
+    default: ''
+
+outputs:
+  target:
+    description: "Deployment target: 'k8s' or 'ssh'"
+    value: ${{ steps.resolve.outputs.target }}
+  is_k8s:
+    description: "True if target is Kubernetes ('true' or 'false')"
+    value: ${{ steps.resolve.outputs.is_k8s }}
+  is_ssh:
+    description: "True if target is SSH Compose ('true' or 'false')"
+    value: ${{ steps.resolve.outputs.is_ssh }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Resolve deployment target
+      id: resolve
+      shell: bash
+      env:
+        DEPLOY_CONFIG_K8S: ${{ inputs.deploy_config_k8s }}
+        SSH_HOST: ${{ inputs.ssh_host }}
+        SSH_USER: ${{ inputs.ssh_user }}
+        SSH_KEY: ${{ inputs.ssh_key }}
+        SSH_KNOWN_HOSTS: ${{ inputs.ssh_known_hosts }}
+      run: |
+        set -euo pipefail
+
+        # Strip whitespace for check
+        K8S_VAL=$(echo "$DEPLOY_CONFIG_K8S" | tr -d '[:space:]')
+        if [ -n "$K8S_VAL" ]; then
+          echo "Selected deployment target: Kubernetes"
+          echo "target=k8s" >> "$GITHUB_OUTPUT"
+          echo "is_k8s=true" >> "$GITHUB_OUTPUT"
+          echo "is_ssh=false" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        # Check SSH parameters
+        MISSING=()
+        [ -z "$(echo "$SSH_HOST" | tr -d '[:space:]')" ] && MISSING+=("ssh_host")
+        [ -z "$(echo "$SSH_USER" | tr -d '[:space:]')" ] && MISSING+=("ssh_user")
+        [ -z "$(echo "$SSH_KEY" | tr -d '[:space:]')" ] && MISSING+=("ssh_key")
+        [ -z "$(echo "$SSH_KNOWN_HOSTS" | tr -d '[:space:]')" ] && MISSING+=("ssh_known_hosts")
+
+        if [ "${#MISSING[@]}" -eq 0 ]; then
+          echo "Selected deployment target: SSH Compose"
+          echo "target=ssh" >> "$GITHUB_OUTPUT"
+          echo "is_k8s=false" >> "$GITHUB_OUTPUT"
+          echo "is_ssh=true" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        if [ "${#MISSING[@]}" -lt 4 ]; then
+          MISSING_STR=$(IFS=', '; echo "${MISSING[*]}")
+          echo "::error::Incomplete SSH configuration: missing ${MISSING_STR}"
+          exit 1
+        fi
+
+        echo "::error::Neither Kubernetes (DEPLOY_CONFIG_K8S) nor SSH (SSH_HOST, SSH_USER, SSH_PRIVATE_KEY, SSH_KNOWN_HOSTS) configuration is provided"
+        exit 1

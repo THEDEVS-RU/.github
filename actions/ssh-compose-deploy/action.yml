@@ -1,0 +1,136 @@
+name: 'SSH Compose Deploy'
+description: 'Deploys docker-compose application over SSH with health checking and automatic rollback'
+
+inputs:
+  host:
+    description: 'Target server IP or hostname'
+    required: true
+  port:
+    description: 'SSH port'
+    required: false
+    default: '22'
+  user:
+    description: 'SSH user'
+    required: true
+  key:
+    description: 'SSH private key'
+    required: true
+  known_hosts:
+    description: 'SSH known_hosts string'
+    required: true
+  image:
+    description: 'Base target image name without tag'
+    required: true
+  tag:
+    description: 'Target image tag'
+    required: true
+  app_dir:
+    description: 'Remote application directory on target host'
+    required: true
+  compose_dir:
+    description: 'Local directory containing docker-compose.yml'
+    required: false
+    default: 'Deployment/compose'
+  service_name:
+    description: 'Docker Compose service name'
+    required: false
+    default: 'app'
+  container_name:
+    description: 'Container name'
+    required: false
+    default: 'app'
+  healthcheck_port:
+    description: 'Port for readiness probe'
+    required: false
+    default: '8080'
+  healthcheck_path:
+    description: 'HTTP path for readiness probe'
+    required: false
+    default: '/login'
+  healthcheck_timeout:
+    description: 'Readiness probe timeout in seconds'
+    required: false
+    default: '300'
+
+outputs:
+  deployed_image:
+    description: 'Actual deployed image from docker inspect'
+    value: ${{ steps.deploy.outputs.deployed_image }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: SSH Compose Deploy
+      id: deploy
+      shell: bash
+      env:
+        HOST: ${{ inputs.host }}
+        PORT: ${{ inputs.port }}
+        USER: ${{ inputs.user }}
+        KEY: ${{ inputs.key }}
+        KNOWN_HOSTS: ${{ inputs.known_hosts }}
+        IMAGE: ${{ inputs.image }}
+        TAG: ${{ inputs.tag }}
+        APP_DIR: ${{ inputs.app_dir }}
+        COMPOSE_DIR: ${{ inputs.compose_dir }}
+        SERVICE_NAME: ${{ inputs.service_name }}
+        CONTAINER_NAME: ${{ inputs.container_name }}
+        HEALTHCHECK_PORT: ${{ inputs.healthcheck_port }}
+        HEALTHCHECK_PATH: ${{ inputs.healthcheck_path }}
+        HEALTHCHECK_TIMEOUT: ${{ inputs.healthcheck_timeout }}
+        ACTION_PATH: ${{ github.action_path }}
+      run: |
+        set -euo pipefail
+
+        for pair in "host:$HOST" "port:$PORT" "user:$USER" "key:$KEY" \
+                    "known_hosts:$KNOWN_HOSTS" "image:$IMAGE" "tag:$TAG" \
+                    "app_dir:$APP_DIR"; do
+          input_name="${pair%%:*}"
+          input_value="${pair#*:}"
+          if [ -z "${input_value//[[:space:]]/}" ]; then
+            echo "::error::Required input '$input_name' is missing or empty" >&2
+            exit 1
+          fi
+        done
+
+        COMPOSE_FILE="${COMPOSE_DIR}/docker-compose.yml"
+        if [ ! -f "$COMPOSE_FILE" ]; then
+          echo "::error::docker-compose.yml not found at: $COMPOSE_FILE" >&2
+          exit 1
+        fi
+
+        DEPLOY_SCRIPT="${ACTION_PATH}/deploy.sh"
+        if [ ! -f "$DEPLOY_SCRIPT" ]; then
+          echo "::error::deploy.sh not found at: $DEPLOY_SCRIPT" >&2
+          exit 1
+        fi
+
+        TMP_SSH_DIR=$(mktemp -d)
+        trap 'rm -rf "$TMP_SSH_DIR"' EXIT
+
+        printf '%s\n' "$KEY" > "$TMP_SSH_DIR/id_key"
+        chmod 0600 "$TMP_SSH_DIR/id_key"
+
+        printf '%s\n' "$KNOWN_HOSTS" > "$TMP_SSH_DIR/known_hosts"
+        chmod 0600 "$TMP_SSH_DIR/known_hosts"
+
+        SSH_CMD=(ssh -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$TMP_SSH_DIR/known_hosts" -i "$TMP_SSH_DIR/id_key" -p "$PORT" "$USER@$HOST")
+        SCP_CMD=(scp -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$TMP_SSH_DIR/known_hosts" -i "$TMP_SSH_DIR/id_key" -P "$PORT")
+
+        echo "Connecting to $USER@$HOST:$PORT and ensuring $APP_DIR exists..."
+        "${SSH_CMD[@]}" "mkdir -p '$APP_DIR'"
+
+        echo "Copying docker-compose.yml from $COMPOSE_FILE to $APP_DIR..."
+        "${SCP_CMD[@]}" "$COMPOSE_FILE" "$USER@$HOST:$APP_DIR/docker-compose.yml"
+
+        echo "Copying deploy.sh from $DEPLOY_SCRIPT to $APP_DIR..."
+        "${SCP_CMD[@]}" "$DEPLOY_SCRIPT" "$USER@$HOST:$APP_DIR/deploy.sh"
+        "${SSH_CMD[@]}" "chmod +x '$APP_DIR/deploy.sh'"
+
+        echo "Running deploy.sh on $HOST..."
+        "${SSH_CMD[@]}" "APP_DIR='$APP_DIR' IMAGE_NAME='$IMAGE' IMAGE_TAG='$TAG' CONTAINER_NAME='$CONTAINER_NAME' SERVICE_NAME='$SERVICE_NAME' HEALTHCHECK_PORT='$HEALTHCHECK_PORT' HEALTHCHECK_PATH='$HEALTHCHECK_PATH' HEALTHCHECK_TIMEOUT='$HEALTHCHECK_TIMEOUT' '$APP_DIR/deploy.sh' '$TAG' '$IMAGE' '$CONTAINER_NAME' '$SERVICE_NAME' '$HEALTHCHECK_TIMEOUT' '$HEALTHCHECK_PORT' '$HEALTHCHECK_PATH'"
+
+        echo "Inspecting deployed image from container $CONTAINER_NAME..."
+        DEPLOYED_IMAGE=$("${SSH_CMD[@]}" "docker inspect -f '{{.Config.Image}}' '$CONTAINER_NAME'" | tr -d '\r\n')
+        echo "deployed_image=$DEPLOYED_IMAGE" >> "$GITHUB_OUTPUT"
+        echo "Successfully deployed image: $DEPLOYED_IMAGE"
