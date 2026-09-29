@@ -135,8 +135,6 @@ runs:
           DOCKERHUB_B64=$(printf '%s:%s' "$DOCKERHUB_USERNAME" "$DOCKERHUB_TOKEN" | base64 -w0)
         fi
 
-        REGISTRY_SERVER="${REGISTRY_SERVER:-registry.thedevs.ru}"
-        REGISTRY_USERNAME="${REGISTRY_USERNAME:-thedevsru}"
         REGISTRY_B64=""
         if [ -n "$REGISTRY_USERNAME" ] && [ -n "$REGISTRY_TOKEN" ]; then
           REGISTRY_B64=$(printf '%s:%s' "$REGISTRY_USERNAME" "$REGISTRY_TOKEN" | base64 -w0)
@@ -196,18 +194,36 @@ runs:
             args:
             - |
               cp /secret-orig/.dockerconfigjson /docker-config/config.json 2>/dev/null || echo '{"auths":{}}' > /docker-config/config.json
+              tr -d '\r\n' < /docker-config/config.json > /docker-config/config.json.flat && mv /docker-config/config.json.flat /docker-config/config.json
               if [ -n "\$REGISTRY_B64" ]; then
-                if grep -q '"auths":{}' /docker-config/config.json; then
-                  sed -i 's|"auths":{}|"auths":{"'"\$REGISTRY_SERVER"'":{"auth":"'"\$REGISTRY_B64"'"}}|' /docker-config/config.json
+                sed -i -E "s|,[[:space:]]*\"\$REGISTRY_SERVER\"[[:space:]]*:[[:space:]]*\{[^{}]*\}||g" /docker-config/config.json
+                sed -i -E "s|\"\$REGISTRY_SERVER\"[[:space:]]*:[[:space:]]*\{[^{}]*\}[[:space:]]*,?||g" /docker-config/config.json
+                if grep -q -E '"auths"[[:space:]]*:[[:space:]]*\{[[:space:]]*\}' /docker-config/config.json; then
+                  sed -i -E 's|"auths"[[:space:]]*:[[:space:]]*\{[[:space:]]*\}|"auths":{"'"\$REGISTRY_SERVER"'":{"auth":"'"\$REGISTRY_B64"'"}}|' /docker-config/config.json
+                elif grep -q -E '"auths"[[:space:]]*:[[:space:]]*\{' /docker-config/config.json; then
+                  sed -i -E 's|"auths"[[:space:]]*:[[:space:]]*\{|"auths":{"'"\$REGISTRY_SERVER"'":{"auth":"'"\$REGISTRY_B64"'"},|' /docker-config/config.json
                 else
-                  sed -i 's|"auths":{|"auths":{"'"\$REGISTRY_SERVER"'":{"auth":"'"\$REGISTRY_B64"'"},|' /docker-config/config.json
+                  echo '{"auths":{"'"\$REGISTRY_SERVER"'":{"auth":"'"\$REGISTRY_B64"'"}}}' > /docker-config/config.json
+                fi
+                if ! grep -q "\$REGISTRY_SERVER" /docker-config/config.json; then
+                  echo "::error::Failed to inject registry auth for \$REGISTRY_SERVER"
+                  exit 1
                 fi
               fi
               if [ -n "\$DOCKERHUB_B64" ]; then
-                if grep -q '"auths":{}' /docker-config/config.json; then
-                  sed -i 's|"auths":{}|"auths":{"https://index.docker.io/v1/":{"auth":"'"\$DOCKERHUB_B64"'"}}|' /docker-config/config.json
+                DH_SRV="https://index.docker.io/v1/"
+                sed -i -E "s|,[[:space:]]*\"\$DH_SRV\"[[:space:]]*:[[:space:]]*\{[^{}]*\}||g" /docker-config/config.json
+                sed -i -E "s|\"\$DH_SRV\"[[:space:]]*:[[:space:]]*\{[^{}]*\}[[:space:]]*,?||g" /docker-config/config.json
+                if grep -q -E '"auths"[[:space:]]*:[[:space:]]*\{[[:space:]]*\}' /docker-config/config.json; then
+                  sed -i -E 's|"auths"[[:space:]]*:[[:space:]]*\{[[:space:]]*\}|"auths":{"https://index.docker.io/v1/":{"auth":"'"\$DOCKERHUB_B64"'"}}|' /docker-config/config.json
+                elif grep -q -E '"auths"[[:space:]]*:[[:space:]]*\{' /docker-config/config.json; then
+                  sed -i -E 's|"auths"[[:space:]]*:[[:space:]]*\{|"auths":{"https://index.docker.io/v1/":{"auth":"'"\$DOCKERHUB_B64"'"},|' /docker-config/config.json
                 else
-                  sed -i 's|"auths":{|"auths":{"https://index.docker.io/v1/":{"auth":"'"\$DOCKERHUB_B64"'"},|' /docker-config/config.json
+                  echo '{"auths":{"https://index.docker.io/v1/":{"auth":"'"\$DOCKERHUB_B64"'"}}}' > /docker-config/config.json
+                fi
+                if ! grep -q "https://index.docker.io/v1/" /docker-config/config.json; then
+                  echo "::error::Failed to inject Docker Hub auth"
+                  exit 1
                 fi
               fi
             env:
