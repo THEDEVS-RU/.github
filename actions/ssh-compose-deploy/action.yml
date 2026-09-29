@@ -169,7 +169,7 @@ runs:
         echo "Successfully deployed image: $DEPLOYED_IMAGE"
 
         case "$DEPLOYED_IMAGE" in
-          *":$TAG"*)
+          "$IMAGE:$TAG"|*":$TAG")
             echo "Image tag matches expected :$TAG"
             ;;
           *)
