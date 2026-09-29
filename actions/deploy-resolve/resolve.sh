@@ -39,7 +39,7 @@ check_env_is_prod() {
 
 ACT="${ACTION:-}"
 if [ -z "$ACT" ]; then
-  echo "::error::Input 'action' is required and must be one of: environments, target, guard."
+  echo "::error::Input 'action' is required and must be one of: environments, guard."
   exit 1
 fi
 
@@ -91,33 +91,8 @@ case "$ACT" in
     fi
     ;;
 
-  target)
-    if [ -z "${TARGET_ENV:-}" ]; then
-      echo "::error::Input 'environment' is required for action 'target'."
-      exit 1
-    fi
-    validate_env_name "$TARGET_ENV" "environment"
-
-    IS_PROD=$(check_env_is_prod "$TARGET_ENV" "${PROD_ENVS:-}")
-    echo "is_prod=$IS_PROD" >> "$GITHUB_OUTPUT"
-
-    if [ "${PROD_GUARD:-false}" = "true" ] && [ "$IS_PROD" = "true" ]; then
-      echo "::error::'$TARGET_ENV' is a prod environment — prod deploys go through release.yml or redeploy.yml, not build.yml"
-      exit 1
-    fi
-
-    if [ "${HAS_K8S_CONFIG:-false}" = "true" ]; then
-      echo "mode=k8s" >> "$GITHUB_OUTPUT"
-    elif [ "${HAS_SSH_KEY:-false}" = "true" ]; then
-      echo "mode=ssh" >> "$GITHUB_OUTPUT"
-    else
-      echo "::error::Neither DEPLOY_CONFIG_K8S nor SSH_PRIVATE_KEY is configured for environment '$TARGET_ENV'. Deployment aborted."
-      exit 1
-    fi
-    ;;
-
   *)
-    echo "::error::Input 'action' must be one of: environments, target, guard. Got: '$ACT'"
+    echo "::error::Input 'action' must be one of: environments, guard. Got: '$ACT'"
     exit 1
     ;;
 esac
