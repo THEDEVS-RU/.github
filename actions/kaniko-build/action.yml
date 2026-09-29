@@ -21,6 +21,18 @@ inputs:
     description: 'Secret name with registry auth (type kubernetes.io/dockerconfigjson)'
     required: false
     default: 'thedevs-registry-secret'
+  registry_token:
+    description: 'Auth token or password for corporate registry'
+    required: false
+    default: ''
+  registry_username:
+    description: 'Username for corporate registry'
+    required: false
+    default: 'thedevsru'
+  registry_server:
+    description: 'Server hostname for corporate registry'
+    required: false
+    default: 'registry.thedevs.ru'
   repo:
     description: 'Repository path for Kaniko context'
     required: false
@@ -87,6 +99,9 @@ runs:
         CLAUDE_CLI_VERSION: ${{ inputs.claude_cli_version }}
         DOCKERHUB_USERNAME: ${{ inputs.dockerhub_username }}
         DOCKERHUB_TOKEN: ${{ inputs.dockerhub_token }}
+        REGISTRY_TOKEN: ${{ inputs.registry_token }}
+        REGISTRY_USERNAME: ${{ inputs.registry_username }}
+        REGISTRY_SERVER: ${{ inputs.registry_server }}
         INSECURE: ${{ inputs.insecure }}
         INSECURE_PULL: ${{ inputs.insecure_pull }}
         IMAGE_FS_EXTRACT_RETRY: ${{ inputs.image_fs_extract_retry }}
@@ -120,6 +135,13 @@ runs:
           DOCKERHUB_B64=$(printf '%s:%s' "$DOCKERHUB_USERNAME" "$DOCKERHUB_TOKEN" | base64 -w0)
         fi
 
+        REGISTRY_SERVER="${REGISTRY_SERVER:-registry.thedevs.ru}"
+        REGISTRY_USERNAME="${REGISTRY_USERNAME:-thedevsru}"
+        REGISTRY_B64=""
+        if [ -n "$REGISTRY_USERNAME" ] && [ -n "$REGISTRY_TOKEN" ]; then
+          REGISTRY_B64=$(printf '%s:%s' "$REGISTRY_USERNAME" "$REGISTRY_TOKEN" | base64 -w0)
+        fi
+
         MAX_ATTEMPTS=3
         DEADLINE=$((BUILD_TIMEOUT + 600))
         API_TIMEOUT=600
@@ -132,8 +154,12 @@ runs:
           SECRET_CHECK_ERR=$(kubectl -n "$NS" get secret "$SECRET" --request-timeout=15s 2>&1 >/dev/null || true)
           if [ -n "$SECRET_CHECK_ERR" ]; then
             if printf '%s' "$SECRET_CHECK_ERR" | grep -F -q 'NotFound'; then
-              echo "::error::Docker secret '$SECRET' specified but not found in namespace '$NS'"
-              exit 1
+              if [ -n "$REGISTRY_TOKEN" ]; then
+                echo "::warning::Docker secret '$SECRET' not found in namespace '$NS', but registry_token is provided — proceeding with token auth"
+              else
+                echo "::error::Docker secret '$SECRET' specified but not found in namespace '$NS'"
+                exit 1
+              fi
             else
               echo "::warning::Could not verify secret '$SECRET' in namespace '$NS' (proceeding with optional volume): $SECRET_CHECK_ERR"
             fi
@@ -170,6 +196,13 @@ runs:
             args:
             - |
               cp /secret-orig/.dockerconfigjson /docker-config/config.json 2>/dev/null || echo '{"auths":{}}' > /docker-config/config.json
+              if [ -n "\$REGISTRY_B64" ]; then
+                if grep -q '"auths":{}' /docker-config/config.json; then
+                  sed -i 's|"auths":{}|"auths":{"'"\$REGISTRY_SERVER"'":{"auth":"'"\$REGISTRY_B64"'"}}|' /docker-config/config.json
+                else
+                  sed -i 's|"auths":{|"auths":{"'"\$REGISTRY_SERVER"'":{"auth":"'"\$REGISTRY_B64"'"},|' /docker-config/config.json
+                fi
+              fi
               if [ -n "\$DOCKERHUB_B64" ]; then
                 if grep -q '"auths":{}' /docker-config/config.json; then
                   sed -i 's|"auths":{}|"auths":{"https://index.docker.io/v1/":{"auth":"'"\$DOCKERHUB_B64"'"}}|' /docker-config/config.json
@@ -180,6 +213,10 @@ runs:
             env:
             - name: DOCKERHUB_B64
               value: "${DOCKERHUB_B64}"
+            - name: REGISTRY_B64
+              value: "${REGISTRY_B64}"
+            - name: REGISTRY_SERVER
+              value: "${REGISTRY_SERVER}"
             volumeMounts:
             - name: secret-orig
               mountPath: /secret-orig
