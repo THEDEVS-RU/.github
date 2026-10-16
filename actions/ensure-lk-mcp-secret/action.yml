@@ -1,0 +1,32 @@
+name: 'Ensure LK MCP Secret'
+description: 'Idempotently create or update thedevs-lk-mcp Kubernetes secret in target namespace'
+
+inputs:
+  namespace:
+    description: 'Target Kubernetes namespace'
+    required: true
+    default: 'dev'
+  token:
+    description: 'LK MCP service token (from secrets.THEDEVS_LK_MCP_TOKEN)'
+    required: false
+    default: ''
+  url:
+    description: 'Optional LK MCP URL override (from vars.THEDEVS_LK_MCP_URL)'
+    required: false
+    default: ''
+  secret_name:
+    description: 'Kubernetes secret name'
+    required: false
+    default: 'thedevs-lk-mcp'
+
+runs:
+  using: "composite"
+  steps:
+    - name: Ensure Secret
+      shell: bash
+      env:
+        TARGET_NS: ${{ inputs.namespace }}
+        TOKEN: ${{ inputs.token }}
+        URL: ${{ inputs.url }}
+        SECRET_NAME: ${{ inputs.secret_name }}
+      run: bash "$GITHUB_ACTION_PATH/ensure.sh"
