@@ -3,8 +3,8 @@ product: thedevs-ci
 repo: THEDEVS-RU/.github
 branch: dev
 depends_on: []
-complexity: simple
-impl_model: sonnet
+complexity: architectural
+impl_model: opus
 impl_effort: high
 
 # Контекст
@@ -16,6 +16,7 @@ impl_effort: high
 1. **Устранение дублирования кода (DRY):** исключает размещение 27 локальных копий Gradle init-скрипта в репозиториях аддонов.
 2. **Единая точка истины:** канонический скрипт `ci-addon-tests.init.gradle` хранится строго в каталоге экшена (`actions/setup-addon-tests/ci-addon-tests.init.gradle`) и используется через `${{ github.action_path }}`.
 3. **Безопасность публикации и изоляция проектов:** скрипт регистрирует выделенную публикацию `javaMavenTests` (`<artifactId>-tests`) со своим независимым POM, не включая Gradle Module Metadata (GMM остается выключенным во всем флоте). Метаданные основного артефакта аддона не изменяются, исключая утечку `enforcedPlatform(libs.thedevsbom)` в прикладные проекты.
+4. **Контрактное тестирование и CI в `.github`:** экшен покрывается сквозным контрактным тестом в `tests/test-setup-addon-tests.sh` и проверяется в workflow `.github/workflows/ci.yml`.
 
 # Что сделать
 
@@ -53,8 +54,8 @@ runs:
 Создать файл `actions/setup-addon-tests/ci-addon-tests.init.gradle`, реализующий:
 
 ### 2.1. Изолированная публикация `javaMavenTests` (`<artifactId>-tests`)
-1. Для каждого подпроекта с плагином `java` или `java-library`:
-   - Если в `src/test/java` (или `groovy`, `kotlin`) присутствуют скомпилированные исходные файлы тестов:
+1. Регистрация выполняется лениво через `pluginManager.withPlugin('maven-publish')` и `pluginManager.withPlugin('java')`:
+   - Для каждого подпроекта, не оканчивающегося на `-starter` и `-test`:
      - Идемпотентно регистрируется задача формирования тестового архива:
        ```groovy
        if (tasks.findByName('testJar') == null) {
@@ -64,83 +65,131 @@ runs:
            }
        }
        ```
-     - В задачу `testJar` включается генерация дескриптора `META-INF/thedevs-test.properties` со свойствами из текущей задачи `test`:
-       - `thedevs.test.systemProperties.liquibase.duplicateFileMode=WARN`
-       - `thedevs.test.systemProperties.spring.test.context.cache.maxSize=16`
-       - `thedevs.test.excludeTags=hsql-pending`
-       - А также пользовательские системные свойства из `tasks.named('test', Test).get().systemProperties`.
-     - В блоке `publishing.publications` регистрируется отдельная публикация `javaMavenTests(MavenPublication)`:
+     - В задачу `testJar` включается генерация дескриптора `META-INF/thedevs-test.properties`:
+       - Если в `src/test` нет скомпилированных классов: пишется маркер `thedevs.tests.disabled=true`.
+       - Если тесты присутствуют: записываются системные свойства и теги:
+         - `thedevs.test.systemProperties.liquibase.duplicateFileMode=WARN`
+         - `thedevs.test.systemProperties.spring.test.context.cache.maxSize=16`
+         - `thedevs.test.excludeTags=hsql-pending`
+         - Пользовательские свойства из `tasks.named('test', Test).get().systemProperties`.
+     - В `publishing.publications` регистрируется отдельная публикация `javaMavenTests(MavenPublication)`:
        - `artifactId = "${archName}-tests"`
        - `artifact(tasks.named('testJar'))`
-       - POM генерирует зависимости на основной артефакт `${project.group}:${archName}:${project.version}` и зависимости из `configurations.testRuntimeClasspath` (исключая внутренние проектные классы и платформенные BOM).
-2. `tasks.withType(GenerateModuleMetadata).configureEach { enabled = false }` — GMM принудительно остается выключенным во избежание конфликтов с `enforcedPlatform`.
+       - POM генерирует зависимости через `pom.withXml`:
+         - Зависимость на основной модуль: `<dependency><groupId>${project.group}</groupId><artifactId>${archName}</artifactId><version>${project.version}</version><scope>compile</scope></dependency>`.
+         - Зависимости времени выполнения тестов извлекаются с точными версиями из `configurations.testRuntimeClasspath.incoming.resolutionResult.allComponents`.
+         - Исключаются платформенные BOM (`Category.REGULAR_PLATFORM` и `Category.ENFORCED_PLATFORM`, включая `thedevs-bom` и `jmix-bom`).
+         - Зависимости на внутренние подпроекты (`ProjectDependency`, например `core-test`) записываются по их публикуемому артефакту (`archName`) с сохранением всех объявленных правил исключений (`exclusions`).
+         - Для внешних зависимостей без версий в `build.gradle` (Spring Boot Starter Test, PostgreSQL, FlowUI Test Assist) в POM подставляется фактически разрешенная версия из `resolutionResult`.
+2. `tasks.withType(GenerateModuleMetadata).configureEach { enabled = false }` — GMM принудительно отключен.
 
-### 2.2. Извлечение прямых зависимостей и маппинг стартеров
-1. В хуке после оценки проекта (`afterEvaluate`) анализируются зависимости конфигурации времени выполнения `configurations.runtimeClasspath.incoming.resolutionResult.root.dependencies`.
-2. Фильтруются только прямые производственные зависимости с группой `group.startsWith('ru.thedevs')`:
-   - Исключаются подпроекты текущей мультимодульной сборки.
-   - Исключаются платформенные BOM (`Category.CATEGORY_ATTRIBUTE == Category.REGULAR_PLATFORM` или артефакты без jar).
-   - Зависимости из `testImplementation` игнорируются (исключение тестовых библиотек-утилит из тестирования контрактов).
-3. Маппинг стартеров в модули тестов:
-   - Если имя зависимости оканчивается на `-starter` (`${module}-starter`), целевым именем базового модуля тестов является `${module}` (например, `core-starter` -> `core`, `balance-starter` -> `balance`, `limiter-starter` -> `limiter`).
-   - Имя тестового артефакта формируется по правилу: `"${depGroup}:${baseModule}-tests:${depVersion}"` с точными группой и версией из графа зависимостей.
-
-### 2.3. Генерация изолированных задач `testAddon_${baseName}`
-Для каждого найденного базового модуля зависимости:
-1. Создается конфигурация `addonTestClasspath_${baseName}`:
+### 2.2. Разрешение графа зависимостей после завершения оценки проектов (`gradle.projectsEvaluated`)
+1. Для исключения конфликта с плагином `io.jmix` (который добавляет `jmix-bom` в хуке `project.afterEvaluate`), разрешение зависимостей и регистрация задач `testAddon_*` откладывается до хука `gradle.projectsEvaluated`:
    ```groovy
-   def depConf = configurations.maybeCreate("addonTestClasspath_${baseName}")
+   gradle.projectsEvaluated {
+       // Выполняется строго после всех project.afterEvaluate, когда Jmix BOM уже добавлен в implementation
+   }
+   ```
+2. Для основного модуля аддона (не являющегося `-starter` и `-test`):
+   - Инспектируются прямые зависимости `configurations.runtimeClasspath.incoming.resolutionResult.root.dependencies`.
+   - Отбираются `ResolvedDependencyResult`, группа которых начинается с `ru.thedevs`.
+   - Исключаются BOM-платформы (проверка атрибута `Category.CATEGORY_ATTRIBUTE in [Category.REGULAR_PLATFORM, Category.ENFORCED_PLATFORM]`).
+   - Исключаются подпроекты текущей сборки.
+   - Зависимости `testImplementation` игнорируются.
+
+### 2.3. Маппинг стартеров в модули тестов через граф зависимостей
+1. Определение целевого модуля тестов выполняется без эвристического отрезания суффикса `-starter`:
+   - Если прямая зависимость является стартером, в разрешенном графе инспектируются исходящие зависимости компонента стартера (`selected.dependencies`).
+   - Находится дочерний модуль с той же группой и версией (например, для `tinkoff-starter` находится модуль `itink`, для `core-starter` — `core`, для `balance-starter` — `balance`).
+   - Имя найденного модуля (`baseModule`) используется как целевое для тестов.
+2. Целевые координаты тестового артефакта формируются с точной группой и версией из графа: `"${depGroup}:${baseModule}-tests:${depVersion}"`.
+
+### 2.4. Генерация изолированных задач `testAddon_${baseModule}`
+Для каждого найденного целевого модуля:
+1. Создается конфигурация `addonTestClasspath_${baseModule}`:
+   ```groovy
+   def depConf = configurations.maybeCreate("addonTestClasspath_${baseModule}")
    depConf.canBeConsumed = false
    depConf.canBeResolved = true
    depConf.transitive = true
-   dependencies.add(depConf.name, "${depGroup}:${baseName}-tests:${depVersion}")
+   dependencies.add(depConf.name, "${depGroup}:${baseModule}-tests:${depVersion}")
    depConf.shouldResolveConsistentlyWith(configurations.runtimeClasspath)
    ```
-2. Создается задача типа `Test` с именем `testAddon_${baseName}`:
-   - `testClassesDirs`: распакованные классы тестов из `${baseName}-tests.jar` в `layout.buildDirectory.dir("addon-tests/${baseName}/classes")`.
-   - `classpath`: артефакты `depConf` + `sourceSets.main.output` текущего модуля + `sourceSets.main.output` стартер-модуля хоста (для применения автоконфигурации `@EnableAutoConfiguration`) + `configurations.runtimeClasspath`.
-   - `sourceSets.test.output` текущего модуля в classpath **НЕ добавляется** (полная изоляция ресурсов и контекста).
-   - Настройка тестового раннера: `useJUnitPlatform()`, `filter.failOnNoMatchingTests = false`.
-   - Системные свойства и теги считываются из упакованного `META-INF/thedevs-test.properties` с платформенными значениями (`duplicateFileMode=WARN`, `spring.test.context.cache.maxSize=16`, `excludeTags 'hsql-pending'`).
-   - Изолированные отчеты:
-     - XML: `layout.buildDirectory.dir("test-results/testAddon_${baseName}")`
-     - HTML: `layout.buildDirectory.dir("reports/tests/testAddon_${baseName}")`
-3. Создается агрегирующая задача `testAddonDependencies`:
-   - Зависит от всех зарегистрированных задач `testAddon_*`.
-   - Включается в жизненный цикл: `check.dependsOn(testAddonDependencies)`.
-   - Задача `test` остается независимой и быстрой для локального цикла разработки.
+2. Создается задача `testAddon_${baseModule}` (тип `Test`):
+   - Распаковка `${baseModule}-tests.jar` в `layout.buildDirectory.dir("addon-tests/${baseModule}/classes")`.
+   - Если в `META-INF/thedevs-test.properties` указано `thedevs.tests.disabled=true`, задача регистрирует факт отсутствия тестов по дизайну и пропускает запуск.
+   - `classpath`: артефакты `depConf` + `sourceSets.main.output` текущего модуля + `sourceSets.main.output` стартера текущего модуля (для применения автоконфигурации `@EnableAutoConfiguration`) + `configurations.runtimeClasspath`.
+   - `sourceSets.test.output` текущего модуля исключен.
+   - `testClassesDirs = layout.buildDirectory.dir("addon-tests/${baseModule}/classes")`.
+   - Настройки: `useJUnitPlatform()`, `filter.failOnNoMatchingTests = false`.
+   - Системные свойства и теги считываются из упакованного дескриптора.
+   - Отчеты сохраняются в `test-results/testAddon_${baseModule}` и `reports/tests/testAddon_${baseModule}`.
+3. Агрегирующая задача `testAddonDependencies`:
+   - Зависит от всех задач `testAddon_*`.
+   - Подключается к `check.dependsOn(testAddonDependencies)`.
 
-### 2.4. Дифференцированная обработка ошибок и Strict Mode
-1. Сетевые ошибки (Timeout, Connection refused), HTTP 401/403/500 приводят к немедленному падению сборки с ошибкой `GradleException`.
-2. Отсутствие тестового артефакта:
-   - В обычном режиме (Фазы 1–3 раскатки): задача `testAddon_${baseName}` пропускается с выводом в лог и генерацией предупреждения `::warning::[TD-2039] Skipped dependency tests for '${depGroup}:${baseModule}': tests artifact not yet published (pre-rollout).`
-   - В строгом режиме (`-Pthedevs.tests.strict=true`): сборка завершается с ошибкой, если зависимость не имеет явного маркера отсутствия тестов по дизайну (`thedevs.tests.disabled=true`).
+### 2.5. Дифференцированная классификация ошибок и Strict Mode
+1. Сетевые сбои (ConnectException, SocketTimeoutException), HTTP 401/403/500 вызывают `GradleException`.
+2. Ошибка разрешения транзитивных зависимостей внутри `<baseModule>-tests`: завершает сборку ошибкой во всех режимах.
+3. Отсутствие корневого артефакта `${baseModule}-tests` в репозитории:
+   - В переходном режиме (Фазы 1–3): выводится `::warning::[TD-2039] Skipped dependency tests for '${depGroup}:${baseModule}': tests artifact not yet published (pre-rollout).`
+   - В строгом режиме (`-Pthedevs.tests.strict=true`): сборка падает с ошибкой, требуя наличия опубликованного tests-артефакта.
 
-## 3. Контрактный тест действия `tests/test-setup-addon-tests.sh`
+## 3. Сквозной контрактный тест `tests/test-setup-addon-tests.sh`
 
-Создать проверочный скрипт `tests/test-setup-addon-tests.sh`:
-- Проверяет валидность синтаксиса `action.yml` и `ci-addon-tests.init.gradle`.
-- Проверяет применение init-скрипта к тестовому мультимодульному проекту Gradle, создание задачи `testJar`, корректность регистрации публикации `javaMavenTests` и отключение GMM.
+Создать скрипт `tests/test-setup-addon-tests.sh`, выполняющий:
+1. Создание локального файлового Maven-репозитория.
+2. Сборку и публикацию фикстуры `upstream` с генерацией `upstream-tests.jar` и POM через `ci-addon-tests.init.gradle`.
+3. Валидацию содержимого POM (отсутствие GMM, корректные версии, импорт зависимостей).
+4. Запуск сборки фикстуры-потребителя `downstream` с резолвом `upstream-tests` и выполнением задачи `testAddonDependencies`.
+
+## 4. Непрерывная интеграция `.github/workflows/ci.yml`
+
+Создать рабочий процесс PR-чека `.github/workflows/ci.yml`:
+```yaml
+name: CI & Contract Tests
+
+on:
+  pull_request:
+    branches: [dev, master]
+  push:
+    branches: [dev]
+
+jobs:
+  contract-tests:
+    name: Contract Tests
+    runs-on: master
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '25'
+          distribution: 'temurin'
+      - name: Run Contract Tests
+        run: bash tests/test-setup-addon-tests.sh
+```
 
 ## Затрагиваемые файлы
 
 1. `actions/setup-addon-tests/action.yml`
 2. `actions/setup-addon-tests/ci-addon-tests.init.gradle`
 3. `tests/test-setup-addon-tests.sh`
+4. `.github/workflows/ci.yml`
 
 # Что уже есть
 
 - Архитектура composite actions в `THEDEVS-RU/.github`: `actions/deploy-resolve`, `actions/kaniko-build`, `actions/ensure-lk-mcp-secret`.
-- Контрактные тесты шелл-скриптов и экшенов в `tests/`.
+- Настройки публикации в Nexus в шаблонах аддонов.
 
 # Критерии готовности
 
-1. Создано композитное действие `actions/setup-addon-tests/action.yml`.
-2. Создан канонический инициализационный скрипт `actions/setup-addon-tests/ci-addon-tests.init.gradle`.
-3. Создан контрактный тест `tests/test-setup-addon-tests.sh`.
-4. Спецификация проходит валидацию `validate-spec-format.sh` с кодом 0.
+1. Создано действие `actions/setup-addon-tests/action.yml`.
+2. Создан канонический скрипт `actions/setup-addon-tests/ci-addon-tests.init.gradle` с регистрацией публикации `javaMavenTests`, хуком `gradle.projectsEvaluated`, маппингом стартеров по графу и отключенным GMM.
+3. Создан end-to-end контрактный тест `tests/test-setup-addon-tests.sh`.
+4. Создан рабочий процесс `.github/workflows/ci.yml`.
+5. Спецификация валидируется `validate-spec-format.sh` с кодом 0.
 
 # Не трогать
 
 - Не изменять существующие экшены `actions/kaniko-build`, `actions/deploy-resolve`, `actions/ensure-lk-mcp-secret`.
-- Не включать публикацию Gradle Module Metadata (`tasks.withType(GenerateModuleMetadata) { enabled = false }` должно строго соблюдаться).
+- Не включать публикацию Gradle Module Metadata (`tasks.withType(GenerateModuleMetadata) { enabled = false }` сохраняется).
