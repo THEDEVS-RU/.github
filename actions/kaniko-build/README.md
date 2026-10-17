@@ -26,12 +26,15 @@
 | `cache_repo` | Репозиторий удаленного кэша слоев Kaniko | Нет | `''` |
 | `build_timeout` | Таймаут сборки в секундах | Нет | `'7200'` |
 | `dockerfile` | Относительный путь к Dockerfile | Нет | `'Dockerfile'` |
-| `claude_cli_version` | Версия Claude CLI для передачи в `--build-arg=CLAUDE_CLI_VERSION` | Нет | `''` |
+| `claude_cli_version` | Версия Claude CLI для передачи в `--build-arg=CLAUDE_CLI_VERSION` (если задана в `build_args`, приоритет у `build_args`) | Нет | `''` |
 | `dockerhub_username` | Логин Docker Hub для аутентифицированных pull | Нет | `''` |
 | `dockerhub_token` | Токен Docker Hub PAT для аутентифицированных pull | Нет | `''` |
 | `insecure` | Флаг передачи `--insecure` в Kaniko | Нет | `'true'` |
 | `insecure_pull` | Флаг передачи `--insecure-pull` в Kaniko | Нет | `'true'` |
 | `image_fs_extract_retry`| Количество повторов распаковки файловой системы в Kaniko | Нет | `'0'` |
+| `cpu_limit` | Лимит CPU для пода Kaniko (например, `16000m`, `8`). `0`, `0m` или `none` снимают лимит. Минимум — `requests.cpu` (`1000m`) | Нет | `'16000m'` |
+| `extra_tags` | Дополнительные теги через запятую или пробел/перевод строки | Нет | `''` |
+| `build_args` | Построчный список аргументов сборки (`KEY=VALUE`, без секретов). Имеет приоритет над `claude_cli_version` | Нет | `''` |
 
 ## Встроенная Pre-flight проверка секрета реестра
 
