@@ -104,6 +104,12 @@ gradle.allprojects { p ->
                 }
 
                 def mainArtifactId = javaMaven.artifactId
+                if ((mainArtifactId == null || mainArtifactId == p.name) && p.pluginManager.hasPlugin('base')) {
+                    def archivesName = p.base.archivesName.orNull
+                    if (archivesName != null && !archivesName.trim().isEmpty()) {
+                        mainArtifactId = archivesName.trim()
+                    }
+                }
                 if (!mainArtifactId || mainArtifactId.trim().isEmpty()) {
                     throw new GradleException("ArtifactId in 'javaMaven' publication of project '${p.path}' is empty")
                 }
