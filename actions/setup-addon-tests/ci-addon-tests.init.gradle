@@ -90,6 +90,9 @@ gradle.allprojects { p ->
 
             // Register afterEvaluate to inspect javaMaven publication after user build script evaluation
             p.afterEvaluate {
+                if (p.state.failure != null) {
+                    return
+                }
                 def publishing = p.extensions.findByType(PublishingExtension)
                 if (publishing == null) {
                     return
