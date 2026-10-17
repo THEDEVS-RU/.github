@@ -1,0 +1,23 @@
+name: 'Setup Addon Tests Environment'
+description: 'Provides canonical ci-addon-tests.init.gradle and configures test dependency execution environment'
+
+outputs:
+  init_script:
+    description: 'Absolute path to canonical ci-addon-tests.init.gradle'
+    value: ${{ steps.export.outputs.init_script }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Export init script path
+      id: export
+      shell: bash
+      run: |
+        SCRIPT_PATH="${{ github.action_path }}/ci-addon-tests.init.gradle"
+        if [ ! -f "$SCRIPT_PATH" ]; then
+          echo "::error::Init script not found at $SCRIPT_PATH"
+          exit 1
+        fi
+        echo "init_script=$SCRIPT_PATH" >> "$GITHUB_OUTPUT"
+        echo "THEDEVS_ADDON_TESTS_INIT=$SCRIPT_PATH" >> "$GITHUB_ENV"
+        echo "Canonical addon tests init script located at: $SCRIPT_PATH"

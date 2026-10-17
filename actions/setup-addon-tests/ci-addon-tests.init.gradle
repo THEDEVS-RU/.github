@@ -1,0 +1,511 @@
+// Canonical Gradle init script for TD-2039: CI Addon Tests Architecture
+// Fleet-wide configuration for separate <artifactId>-tests publishing and isolated dependency test execution.
+
+import org.gradle.api.GradleException
+import org.gradle.api.Project
+import org.gradle.api.artifacts.ProjectDependency
+import org.gradle.api.artifacts.component.ModuleComponentIdentifier
+import org.gradle.api.artifacts.component.ProjectComponentIdentifier
+import org.gradle.api.artifacts.result.ResolvedDependencyResult
+import org.gradle.api.attributes.Category
+import org.gradle.api.publish.PublishingExtension
+import org.gradle.api.publish.maven.MavenPublication
+import org.gradle.api.publish.tasks.GenerateModuleMetadata
+import org.gradle.api.tasks.bundling.Jar
+import org.gradle.api.tasks.testing.Test
+
+def resolveProjectLiquibaseChangelog(Project p) {
+    // 1. From test task systemProperties
+    def testTask = p.tasks.findByName('test')
+    if (testTask instanceof Test) {
+        def sysVal = testTask.systemProperties['main.liquibase.change-log'] ?: testTask.systemProperties['spring.liquibase.change-log']
+        if (sysVal != null && !sysVal.toString().trim().isEmpty()) {
+            return sysVal.toString().trim()
+        }
+    }
+
+    // 2. From test resources property files
+    try {
+        if (p.pluginManager.hasPlugin('java')) {
+            def testResDirs = p.sourceSets.test.resources.srcDirs
+            for (File resDir : testResDirs) {
+                if (!resDir.exists()) continue
+                def propFiles = []
+                resDir.eachFileRecurse { f ->
+                    if (f.isFile() && f.name.endsWith('.properties')) {
+                        propFiles.add(f)
+                    }
+                }
+                for (File pf : propFiles) {
+                    def props = new Properties()
+                    try {
+                        pf.withInputStream { props.load(it) }
+                        def val = props.getProperty('main.liquibase.change-log') ?: props.getProperty('spring.liquibase.change-log')
+                        if (val != null && !val.trim().isEmpty()) {
+                            return val.trim()
+                        }
+                    } catch (Throwable ignored) {}
+                }
+            }
+
+            // 3. From main or test resources changelog XML files
+            def candidateDirs = []
+            candidateDirs.addAll(p.sourceSets.main.resources.srcDirs)
+            candidateDirs.addAll(p.sourceSets.test.resources.srcDirs)
+            for (File resDir : candidateDirs) {
+                if (!resDir.exists()) continue
+                File found = null
+                resDir.eachFileRecurse { f ->
+                    if (f.isFile() && (f.name == 'changelog.xml' || f.name == 'master.xml') && f.parentFile?.name == 'liquibase') {
+                        if (found == null) found = f
+                    }
+                }
+                if (found != null) {
+                    def relPath = resDir.toPath().relativize(found.toPath()).toString().replace('\\', '/')
+                    return relPath
+                }
+            }
+        }
+    } catch (Throwable ignored) {}
+
+    return null
+}
+
+// 2.1. Isolated publication javaMavenTests (<artifactId>-tests)
+gradle.allprojects { p ->
+    p.pluginManager.withPlugin('maven-publish') {
+        p.pluginManager.withPlugin('java') {
+            // Target library modules only: not ending in -starter, -test, -app (except cryptocollector-app)
+            if (p.name.endsWith('-starter') || p.name.endsWith('-test') || (p.name.endsWith('-app') && p.name != 'cryptocollector-app')) {
+                return
+            }
+            if (!p.subprojects.isEmpty()) {
+                return
+            }
+
+            // GMM is strictly disabled fleet-wide
+            p.tasks.withType(GenerateModuleMetadata).configureEach {
+                enabled = false
+            }
+
+            // Register afterEvaluate to inspect javaMaven publication after user build script evaluation
+            p.afterEvaluate {
+                def publishing = p.extensions.findByType(PublishingExtension)
+                if (publishing == null) {
+                    return
+                }
+
+                def javaMaven = publishing.publications.findByName('javaMaven') as MavenPublication
+                if (javaMaven == null) {
+                    throw new GradleException("Could not find 'javaMaven' publication in project '${p.path}' for registering javaMavenTests")
+                }
+
+                def mainArtifactId = javaMaven.artifactId
+                if (!mainArtifactId || mainArtifactId.trim().isEmpty()) {
+                    throw new GradleException("ArtifactId in 'javaMaven' publication of project '${p.path}' is empty")
+                }
+
+                // Register testJar task
+                def testJarTask = p.tasks.maybeCreate('testJar', Jar)
+                testJarTask.archiveBaseName.set("${mainArtifactId}-tests")
+                testJarTask.archiveClassifier.set('')
+                testJarTask.from(p.sourceSets.test.output)
+
+                // Task to generate META-INF/thedevs-test.properties descriptor
+                def generateTestProperties = p.tasks.maybeCreate('generateAddonTestProperties')
+                def generatedDir = p.layout.buildDirectory.dir("generated/thedevs-test/META-INF").get().asFile
+                generateTestProperties.outputs.dir(generatedDir)
+                generateTestProperties.doLast {
+                    generatedDir.mkdirs()
+                    def propsFile = new File(generatedDir, "thedevs-test.properties")
+                    def props = new Properties()
+
+                    boolean hasTestClasses = false
+                    p.sourceSets.test.output.classesDirs.each { dir ->
+                        if (dir.exists()) {
+                            dir.eachFileRecurse { f ->
+                                if (f.isFile() && f.name.endsWith('.class')) {
+                                    hasTestClasses = true
+                                }
+                            }
+                        }
+                    }
+
+                    if (!hasTestClasses) {
+                        props.setProperty('thedevs.tests.disabled', 'true')
+                    } else {
+                        props.setProperty('thedevs.tests.disabled', 'false')
+                        props.setProperty('thedevs.test.systemProperties.liquibase.duplicateFileMode', 'WARN')
+                        props.setProperty('thedevs.test.systemProperties.spring.test.context.cache.maxSize', '16')
+                        props.setProperty('thedevs.test.excludeTags', 'hsql-pending')
+
+                        def testTask = p.tasks.findByName('test')
+                        if (testTask instanceof Test) {
+                            testTask.systemProperties.each { k, v ->
+                                if (v != null) {
+                                    props.setProperty("thedevs.test.systemProperties.${k}", v.toString())
+                                }
+                            }
+                        }
+
+                        String changelogPath = resolveProjectLiquibaseChangelog(p)
+                        if (changelogPath != null) {
+                            props.setProperty('thedevs.test.liquibase.change-log', changelogPath)
+                        } else {
+                            println "::warning::[TD-2039] Could not determine Liquibase changelog for '${p.path}' during testJar generation"
+                        }
+                    }
+
+                    propsFile.withOutputStream { os ->
+                        props.store(os, "Generated by ci-addon-tests.init.gradle for TD-2039")
+                    }
+                }
+
+                testJarTask.dependsOn(generateTestProperties)
+                testJarTask.from(p.layout.buildDirectory.dir("generated/thedevs-test"))
+
+                // Register javaMavenTests publication
+                if (publishing.publications.findByName('javaMavenTests') == null) {
+                    publishing.publications.create('javaMavenTests', MavenPublication) { pub ->
+                        pub.groupId = p.group.toString()
+                        pub.artifactId = "${mainArtifactId}-tests"
+                        pub.version = p.version.toString()
+                        pub.artifact(testJarTask)
+
+                        pub.pom.withXml { xml ->
+                            def rootNode = xml.asNode()
+                            def dependenciesNode = rootNode.children().find {
+                                it instanceof groovy.util.Node && it.name()?.toString()?.endsWith('dependencies')
+                            }
+                            if (dependenciesNode == null) {
+                                dependenciesNode = rootNode.appendNode('dependencies')
+                            }
+
+                            // 1. Dependency on the main module itself
+                            def mainDepNode = dependenciesNode.appendNode('dependency')
+                            mainDepNode.appendNode('groupId', p.group.toString())
+                            mainDepNode.appendNode('artifactId', mainArtifactId)
+                            mainDepNode.appendNode('version', p.version.toString())
+                            mainDepNode.appendNode('scope', 'compile')
+
+                            // 2. Test runtime dependencies from resolution result
+                            def testRuntime = p.configurations.findByName('testRuntimeClasspath')
+                            if (testRuntime != null) {
+                                def resolutionResult = testRuntime.incoming.resolutionResult
+                                def seenCoordinates = new HashSet<String>()
+                                seenCoordinates.add("${p.group}:${mainArtifactId}")
+
+                                resolutionResult.allComponents.each { comp ->
+                                    if (comp == resolutionResult.root) return
+
+                                    // Exclude platforms by Category attribute
+                                    boolean isPlatform = comp.variants.any { v ->
+                                        try {
+                                            def cat = v.attributes.getAttribute(Category.CATEGORY_ATTRIBUTE)
+                                            return cat != null && (cat.name == Category.REGULAR_PLATFORM ||
+                                                                   cat.name == Category.ENFORCED_PLATFORM)
+                                        } catch (Throwable ignored) {
+                                            return false
+                                        }
+                                    }
+                                    if (isPlatform) return
+
+                                    if (comp.id instanceof ModuleComponentIdentifier) {
+                                        def mid = comp.id as ModuleComponentIdentifier
+                                        def coordKey = "${mid.group}:${mid.module}"
+                                        if (seenCoordinates.add(coordKey)) {
+                                            def depNode = dependenciesNode.appendNode('dependency')
+                                            depNode.appendNode('groupId', mid.group)
+                                            depNode.appendNode('artifactId', mid.module)
+                                            depNode.appendNode('version', mid.version)
+                                            depNode.appendNode('scope', 'runtime')
+                                        }
+                                    } else if (comp.id instanceof ProjectComponentIdentifier) {
+                                        def pid = comp.id as ProjectComponentIdentifier
+                                        def subproject = p.rootProject.findProject(pid.projectPath)
+                                        if (subproject != null && subproject != p) {
+                                            def subArtifactId = subproject.findProperty('archivesBaseName') ?:
+                                                (subproject.pluginManager.hasPlugin('base') ? subproject.base.archivesName.get() : subproject.name)
+                                            def subGroup = subproject.group?.toString() ?: p.group.toString()
+                                            def subVersion = subproject.version?.toString() ?: p.version.toString()
+                                            def coordKey = "${subGroup}:${subArtifactId}"
+                                            if (seenCoordinates.add(coordKey)) {
+                                                def depNode = dependenciesNode.appendNode('dependency')
+                                                depNode.appendNode('groupId', subGroup)
+                                                depNode.appendNode('artifactId', subArtifactId)
+                                                depNode.appendNode('version', subVersion)
+                                                depNode.appendNode('scope', 'runtime')
+
+                                                // Preserve declared exclusions
+                                                def projDep = p.configurations.testImplementation.dependencies
+                                                    .withType(ProjectDependency)
+                                                    .find { it.dependencyProject == subproject }
+                                                if (projDep != null && !projDep.excludeRules.isEmpty()) {
+                                                    def exclusionsNode = depNode.appendNode('exclusions')
+                                                    projDep.excludeRules.each { rule ->
+                                                        def exclNode = exclusionsNode.appendNode('exclusion')
+                                                        exclNode.appendNode('groupId', rule.group ?: '*')
+                                                        exclNode.appendNode('artifactId', rule.module ?: '*')
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// 2.2 - 2.5. Dependency resolution, starter mapping and isolated testAddon_* tasks in gradle.projectsEvaluated
+gradle.projectsEvaluated {
+    gradle.allprojects { p ->
+        if (!p.pluginManager.hasPlugin('java')) return
+        if (p.name.endsWith('-starter') || p.name.endsWith('-test') || (p.name.endsWith('-app') && p.name != 'cryptocollector-app')) return
+        if (!p.subprojects.isEmpty()) return
+
+        def runtimeClasspath = p.configurations.findByName('runtimeClasspath')
+        if (runtimeClasspath == null) return
+
+        def testAddonDependencies = p.tasks.maybeCreate('testAddonDependencies')
+        testAddonDependencies.group = 'verification'
+        testAddonDependencies.description = 'Runs tests of all direct ru.thedevs platform dependencies'
+
+        def checkTask = p.tasks.findByName('check')
+        if (checkTask != null) {
+            checkTask.dependsOn(testAddonDependencies)
+        }
+
+        def candidateAddons = new LinkedHashSet<Map<String, String>>()
+        def rootDeps = runtimeClasspath.incoming.resolutionResult.root.dependencies
+
+        rootDeps.each { depResult ->
+            if (!(depResult instanceof ResolvedDependencyResult)) return
+            def resolvedDep = depResult as ResolvedDependencyResult
+            def selected = resolvedDep.selected
+
+            if (selected.id instanceof ProjectComponentIdentifier) return
+
+            def depGroup = selected.moduleVersion?.group ?: ''
+            if (!depGroup.startsWith('ru.thedevs')) return
+
+            boolean isPlatform = selected.variants.any { v ->
+                try {
+                    def cat = v.attributes.getAttribute(Category.CATEGORY_ATTRIBUTE)
+                    return cat != null && (cat.name == Category.REGULAR_PLATFORM ||
+                                           cat.name == Category.ENFORCED_PLATFORM)
+                } catch (Throwable ignored) {
+                    return false
+                }
+            }
+            if (isPlatform) return
+
+            def depName = selected.moduleVersion?.name ?: ''
+            def depVersion = selected.moduleVersion?.version ?: ''
+
+            // Starter mapping: inspect outgoing dependencies
+            String baseModule = depName
+            if (depName.endsWith('-starter')) {
+                def childDep = selected.dependencies.find { childResult ->
+                    if (childResult instanceof ResolvedDependencyResult) {
+                        def childSelected = (childResult as ResolvedDependencyResult).selected
+                        def childGroup = childSelected.moduleVersion?.group ?: ''
+                        def childName = childSelected.moduleVersion?.name ?: ''
+                        return childGroup.startsWith('ru.thedevs') &&
+                               !childName.endsWith('-starter') &&
+                               !childName.endsWith('-bom') &&
+                               !childName.endsWith('-platform')
+                    }
+                    return false
+                }
+                if (childDep != null) {
+                    baseModule = ((childDep as ResolvedDependencyResult).selected.moduleVersion.name)
+                } else {
+                    baseModule = depName.substring(0, depName.length() - '-starter'.length())
+                }
+            }
+
+            candidateAddons.add([group: depGroup, baseModule: baseModule, version: depVersion])
+        }
+
+        candidateAddons.each { addon ->
+            def depGroup = addon.group
+            def baseModule = addon.baseModule
+            def depVersion = addon.version
+
+            // 1. Create configuration addonTestClasspath_${baseModule}
+            def confName = "addonTestClasspath_${baseModule}"
+            def addonTestClasspath = p.configurations.maybeCreate(confName)
+            addonTestClasspath.transitive = true
+            try {
+                addonTestClasspath.shouldResolveConsistentlyWith(runtimeClasspath)
+            } catch (Throwable ignored) {}
+            p.dependencies.add(confName, "${depGroup}:${baseModule}-tests:${depVersion}")
+
+            // 2. Unpack task and aggregate changelog generation
+            def unpackTaskName = "unpackAddonTests_${baseModule}"
+            def classesDir = p.layout.buildDirectory.dir("addon-tests/${baseModule}/classes").get().asFile
+            def aggregateFile = p.layout.buildDirectory.file("addon-tests/${baseModule}/aggregate-changelog.xml").get().asFile
+
+            def unpackTask = p.tasks.maybeCreate(unpackTaskName)
+            unpackTask.outputs.dir(classesDir)
+            unpackTask.outputs.file(aggregateFile)
+
+            def testState = [testsDisabled: false, skippedPreRollout: false]
+
+            unpackTask.doLast {
+                classesDir.mkdirs()
+                aggregateFile.parentFile.mkdirs()
+
+                def isStrict = (p.findProperty('thedevs.tests.strict') == 'true') ||
+                               (p.providers.gradleProperty('thedevs.tests.strict').orNull == 'true')
+
+                def lenient = addonTestClasspath.resolvedConfiguration.lenientConfiguration
+                def unresolved = lenient.unresolvedModuleDependencies
+
+                def rootUnresolved = unresolved.find {
+                    it.selector.group == depGroup && it.selector.name == "${baseModule}-tests"
+                }
+
+                if (rootUnresolved != null) {
+                    def prob = rootUnresolved.problem
+                    def msg = prob?.message ?: ''
+                    if (msg.contains("Connection refused") || msg.contains("timed out") || msg.contains("Timeout") ||
+                        msg.contains("401") || msg.contains("403") || msg.contains("500") || msg.contains("502") || msg.contains("503")) {
+                        throw new GradleException("[TD-2039] Network or repository error resolving '${depGroup}:${baseModule}-tests:${depVersion}': ${msg}", prob)
+                    }
+
+                    if (isStrict) {
+                        throw new GradleException("[TD-2039] Strict mode enabled (-Pthedevs.tests.strict=true): tests artifact '${depGroup}:${baseModule}-tests:${depVersion}' was not found. Tests artifact must be published or the build fails.")
+                    } else {
+                        println "::warning::[TD-2039] Skipped dependency tests for '${depGroup}:${baseModule}': tests artifact not yet published (pre-rollout)."
+                        testState.skippedPreRollout = true
+                        return
+                    }
+                }
+
+                if (!unresolved.isEmpty()) {
+                    throw new GradleException("[TD-2039] Failed to resolve transitive dependencies for '${depGroup}:${baseModule}-tests:${depVersion}': ${unresolved.collect { it.selector }.join(', ')}")
+                }
+
+                def testsJarArtifact = addonTestClasspath.resolvedConfiguration.resolvedArtifacts.find { art ->
+                    art.name == "${baseModule}-tests" || art.file.name.startsWith("${baseModule}-tests-") || art.file.name == "${baseModule}-tests.jar"
+                }
+
+                if (testsJarArtifact == null || !testsJarArtifact.file.exists()) {
+                    if (isStrict) {
+                        throw new GradleException("[TD-2039] Strict mode enabled: tests artifact jar '${depGroup}:${baseModule}-tests:${depVersion}' not found.")
+                    } else {
+                        println "::warning::[TD-2039] Skipped dependency tests for '${depGroup}:${baseModule}': tests artifact not yet published (pre-rollout)."
+                        testState.skippedPreRollout = true
+                        return
+                    }
+                }
+
+                p.copy {
+                    from p.zipTree(testsJarArtifact.file)
+                    into classesDir
+                }
+
+                def propFile = new File(classesDir, "META-INF/thedevs-test.properties")
+                def depProps = new Properties()
+                if (propFile.exists()) {
+                    propFile.withInputStream { depProps.load(it) }
+                }
+
+                if ('true'.equalsIgnoreCase(depProps.getProperty('thedevs.tests.disabled'))) {
+                    println "[TD-2039] Dependency '${depGroup}:${baseModule}' marked with thedevs.tests.disabled=true. No tests to run."
+                    testState.testsDisabled = true
+                }
+
+                def depChangelog = depProps.getProperty('thedevs.test.liquibase.change-log') ?: depProps.getProperty('main.liquibase.change-log')
+                def hostChangelog = resolveProjectLiquibaseChangelog(p)
+
+                if (depChangelog == null) {
+                    println "::warning::[TD-2039] Could not determine Liquibase changelog for dependency '${baseModule}'"
+                }
+                if (hostChangelog == null) {
+                    println "::warning::[TD-2039] Could not determine host Liquibase changelog for project '${p.path}'"
+                }
+
+                def xmlBuilder = new StringBuilder()
+                xmlBuilder.append('<?xml version="1.0" encoding="UTF-8"?>\n')
+                xmlBuilder.append('<databaseChangeLog\n')
+                xmlBuilder.append('    xmlns="http://www.liquibase.org/xml/ns/dbchangelog"\n')
+                xmlBuilder.append('    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"\n')
+                xmlBuilder.append('    xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog\n')
+                xmlBuilder.append('        http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-latest.xsd">\n')
+
+                if (depChangelog != null) {
+                    xmlBuilder.append("    <include file=\"${depChangelog}\" relativeToChangelogFile=\"false\"/>\n")
+                }
+                if (hostChangelog != null && hostChangelog != depChangelog) {
+                    xmlBuilder.append("    <include file=\"${hostChangelog}\" relativeToChangelogFile=\"false\"/>\n")
+                }
+                xmlBuilder.append('</databaseChangeLog>\n')
+                aggregateFile.text = xmlBuilder.toString()
+            }
+
+            // 3. Test task
+            def testTaskName = "testAddon_${baseModule}"
+            def testAddon = p.tasks.maybeCreate(testTaskName, Test)
+            testAddon.group = 'verification'
+            testAddon.description = "Runs tests of dependency ${depGroup}:${baseModule}"
+            testAddon.dependsOn(unpackTask)
+
+            testAddon.testClassesDirs = p.files(classesDir)
+
+            def starterProject = p.rootProject.subprojects.find { it.name.endsWith('-starter') }
+            def starterMainOutput = (starterProject != null && starterProject.pluginManager.hasPlugin('java')) ?
+                starterProject.sourceSets.main.output : p.files()
+
+            testAddon.classpath = p.files(classesDir, aggregateFile.parentFile) +
+                                  addonTestClasspath +
+                                  p.sourceSets.main.output +
+                                  starterMainOutput +
+                                  runtimeClasspath
+
+            testAddon.useJUnitPlatform()
+            testAddon.failOnNoDiscoveredTests = false
+            testAddon.filter.failOnNoMatchingTests = false
+
+            testAddon.reports.html.outputLocation.set(p.layout.buildDirectory.dir("reports/tests/${testTaskName}"))
+            testAddon.reports.junitXml.outputLocation.set(p.layout.buildDirectory.dir("test-results/${testTaskName}"))
+
+            testAddon.doFirst {
+                if (testState.skippedPreRollout || testState.testsDisabled) {
+                    testAddon.setTestClassesDirs(p.files())
+                    return
+                }
+
+                def propFile = new File(classesDir, "META-INF/thedevs-test.properties")
+                if (propFile.exists()) {
+                    def depProps = new Properties()
+                    propFile.withInputStream { depProps.load(it) }
+                    depProps.each { k, v ->
+                        if (k.startsWith('thedevs.test.systemProperties.')) {
+                            def sysProp = k.substring('thedevs.test.systemProperties.'.length())
+                            testAddon.systemProperty(sysProp, v)
+                        }
+                    }
+                    def excludeTags = depProps.getProperty('thedevs.test.excludeTags')
+                    if (excludeTags) {
+                        testAddon.useJUnitPlatform {
+                            it.excludeTags(excludeTags.split(',').collect { t -> t.trim() } as String[])
+                        }
+                    }
+                }
+
+                testAddon.systemProperty('main.liquibase.change-log', aggregateFile.absolutePath)
+                testAddon.systemProperty('spring.liquibase.change-log', aggregateFile.absolutePath)
+                testAddon.systemProperty('liquibase.duplicateFileMode', 'WARN')
+            }
+
+            testAddonDependencies.dependsOn(testAddon)
+        }
+    }
+}
