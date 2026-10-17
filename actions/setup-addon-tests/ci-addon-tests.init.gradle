@@ -14,7 +14,9 @@ import org.gradle.api.publish.tasks.GenerateModuleMetadata
 import org.gradle.api.tasks.bundling.Jar
 import org.gradle.api.tasks.testing.Test
 
-def resolveProjectLiquibaseChangelog(Project p) {
+def resolveProjectTestLiquibaseChangelog(Project p) {
+    if (!p.pluginManager.hasPlugin('java')) return null
+
     // 1. From test task systemProperties
     def testTask = p.tasks.findByName('test')
     if (testTask instanceof Test) {
@@ -24,50 +26,78 @@ def resolveProjectLiquibaseChangelog(Project p) {
         }
     }
 
-    // 2. From test resources property files
-    try {
-        if (p.pluginManager.hasPlugin('java')) {
-            def testResDirs = p.sourceSets.test.resources.srcDirs
-            for (File resDir : testResDirs) {
-                if (!resDir.exists()) continue
-                def propFiles = []
-                resDir.eachFileRecurse { f ->
-                    if (f.isFile() && f.name.endsWith('.properties')) {
-                        propFiles.add(f)
-                    }
-                }
-                for (File pf : propFiles) {
-                    def props = new Properties()
-                    try {
-                        pf.withInputStream { props.load(it) }
-                        def val = props.getProperty('main.liquibase.change-log') ?: props.getProperty('spring.liquibase.change-log')
-                        if (val != null && !val.trim().isEmpty()) {
-                            return val.trim()
-                        }
-                    } catch (Throwable ignored) {}
-                }
+    // 2. From test resources property files (*.properties)
+    for (File resDir : p.sourceSets.test.resources.srcDirs) {
+        if (!resDir.exists()) continue
+        def propFiles = []
+        resDir.eachFileRecurse { f ->
+            if (f.isFile() && f.name.endsWith('.properties')) {
+                propFiles.add(f)
             }
-
-            // 3. From main or test resources changelog XML files
-            def candidateDirs = []
-            candidateDirs.addAll(p.sourceSets.main.resources.srcDirs)
-            candidateDirs.addAll(p.sourceSets.test.resources.srcDirs)
-            for (File resDir : candidateDirs) {
-                if (!resDir.exists()) continue
-                File found = null
-                resDir.eachFileRecurse { f ->
-                    if (f.isFile() && (f.name == 'changelog.xml' || f.name == 'master.xml') && f.parentFile?.name == 'liquibase') {
-                        if (found == null) found = f
-                    }
+        }
+        for (File pf : propFiles) {
+            def props = new Properties()
+            try {
+                pf.withInputStream { props.load(it) }
+                def val = props.getProperty('main.liquibase.change-log') ?: props.getProperty('spring.liquibase.change-log')
+                if (val != null && !val.trim().isEmpty()) {
+                    return val.trim()
                 }
-                if (found != null) {
-                    def relPath = resDir.toPath().relativize(found.toPath()).toString().replace('\\', '/')
-                    return relPath
+            } catch (Exception ignored) {}
+        }
+    }
+
+    // 3. From main resources changelog XML files
+    for (File resDir : p.sourceSets.main.resources.srcDirs) {
+        if (!resDir.exists()) continue
+        File found = null
+        resDir.eachFileRecurse { f ->
+            if (f.isFile() && (f.name == 'changelog.xml' || f.name == 'master.xml') && f.parentFile?.name == 'liquibase') {
+                if (found == null) found = f
+            }
+        }
+        if (found != null) {
+            return resDir.toPath().relativize(found.toPath()).toString().replace('\\', '/')
+        }
+    }
+
+    // 4. From test resources changelog XML files
+    for (File resDir : p.sourceSets.test.resources.srcDirs) {
+        if (!resDir.exists()) continue
+        File found = null
+        resDir.eachFileRecurse { f ->
+            if (f.isFile() && (f.name == 'changelog.xml' || f.name == 'master.xml') && f.parentFile?.name == 'liquibase') {
+                if (found == null) found = f
+            }
+        }
+        if (found != null) {
+            return resDir.toPath().relativize(found.toPath()).toString().replace('\\', '/')
+        }
+    }
+
+    return null
+}
+
+def resolveHostMainLiquibaseChangelog(Project p) {
+    if (!p.pluginManager.hasPlugin('java')) return null
+    File found = null
+    File matchedResDir = null
+    for (File resDir : p.sourceSets.main.resources.srcDirs) {
+        if (!resDir.exists()) continue
+        resDir.eachFileRecurse { f ->
+            if (f.isFile() && (f.name == 'changelog.xml' || f.name == 'master.xml') && f.parentFile?.name == 'liquibase') {
+                if (found == null) {
+                    found = f
+                    matchedResDir = resDir
                 }
             }
         }
-    } catch (Throwable ignored) {}
-
+        if (found != null) break
+    }
+    if (found != null && matchedResDir != null) {
+        def relPath = matchedResDir.toPath().relativize(found.toPath()).toString().replace('\\', '/')
+        return [path: relPath, file: found]
+    }
     return null
 }
 
@@ -75,8 +105,8 @@ def resolveProjectLiquibaseChangelog(Project p) {
 gradle.allprojects { p ->
     p.pluginManager.withPlugin('maven-publish') {
         p.pluginManager.withPlugin('java') {
-            // Target library modules only: not ending in -starter, -test, -app (except cryptocollector-app)
-            if (p.name.endsWith('-starter') || p.name.endsWith('-test') || (p.name.endsWith('-app') && p.name != 'cryptocollector-app')) {
+            // Target library modules only: not ending in -starter, -test, -app
+            if (p.name.endsWith('-starter') || p.name.endsWith('-test') || p.name.endsWith('-app')) {
                 return
             }
             if (!p.subprojects.isEmpty()) {
@@ -103,13 +133,7 @@ gradle.allprojects { p ->
                     throw new GradleException("Could not find 'javaMaven' publication in project '${p.path}' for registering javaMavenTests")
                 }
 
-                def mainArtifactId = javaMaven.artifactId
-                if ((mainArtifactId == null || mainArtifactId == p.name) && p.pluginManager.hasPlugin('base')) {
-                    def archivesName = p.base.archivesName.orNull
-                    if (archivesName != null && !archivesName.trim().isEmpty()) {
-                        mainArtifactId = archivesName.trim()
-                    }
-                }
+                def mainArtifactId = javaMaven.artifactId ?: (p.pluginManager.hasPlugin('base') ? p.base.archivesName.orNull : p.name)
                 if (!mainArtifactId || mainArtifactId.trim().isEmpty()) {
                     throw new GradleException("ArtifactId in 'javaMaven' publication of project '${p.path}' is empty")
                 }
@@ -122,6 +146,17 @@ gradle.allprojects { p ->
 
                 // Task to generate META-INF/thedevs-test.properties descriptor
                 def generateTestProperties = p.tasks.maybeCreate('generateAddonTestProperties')
+                def testClassesTask = p.tasks.findByName('testClasses')
+                if (testClassesTask != null) {
+                    generateTestProperties.dependsOn(testClassesTask)
+                }
+                generateTestProperties.inputs.files(p.sourceSets.test.output.classesDirs)
+                def testTask = p.tasks.findByName('test')
+                if (testTask instanceof Test) {
+                    generateTestProperties.inputs.property("testSystemProperties", {
+                        testTask.systemProperties.toString()
+                    })
+                }
                 def generatedDir = p.layout.buildDirectory.dir("generated/thedevs-test/META-INF").get().asFile
                 generateTestProperties.outputs.dir(generatedDir)
                 generateTestProperties.doLast {
@@ -145,10 +180,7 @@ gradle.allprojects { p ->
                     } else {
                         props.setProperty('thedevs.tests.disabled', 'false')
                         props.setProperty('thedevs.test.systemProperties.liquibase.duplicateFileMode', 'WARN')
-                        props.setProperty('thedevs.test.systemProperties.spring.test.context.cache.maxSize', '16')
-                        props.setProperty('thedevs.test.excludeTags', 'hsql-pending')
 
-                        def testTask = p.tasks.findByName('test')
                         if (testTask instanceof Test) {
                             testTask.systemProperties.each { k, v ->
                                 if (v != null) {
@@ -157,7 +189,7 @@ gradle.allprojects { p ->
                             }
                         }
 
-                        String changelogPath = resolveProjectLiquibaseChangelog(p)
+                        String changelogPath = resolveProjectTestLiquibaseChangelog(p)
                         if (changelogPath != null) {
                             props.setProperty('thedevs.test.liquibase.change-log', changelogPath)
                         } else {
@@ -213,7 +245,7 @@ gradle.allprojects { p ->
                                             def cat = v.attributes.getAttribute(Category.CATEGORY_ATTRIBUTE)
                                             return cat != null && (cat.name == Category.REGULAR_PLATFORM ||
                                                                    cat.name == Category.ENFORCED_PLATFORM)
-                                        } catch (Throwable ignored) {
+                                        } catch (Exception ignored) {
                                             return false
                                         }
                                     }
@@ -228,13 +260,19 @@ gradle.allprojects { p ->
                                             depNode.appendNode('artifactId', mid.module)
                                             depNode.appendNode('version', mid.version)
                                             depNode.appendNode('scope', 'runtime')
+
+                                            // Wildcard exclusions to keep flattened closure exactly identical
+                                            def exclusionsNode = depNode.appendNode('exclusions')
+                                            def exclNode = exclusionsNode.appendNode('exclusion')
+                                            exclNode.appendNode('groupId', '*')
+                                            exclNode.appendNode('artifactId', '*')
                                         }
                                     } else if (comp.id instanceof ProjectComponentIdentifier) {
                                         def pid = comp.id as ProjectComponentIdentifier
                                         def subproject = p.rootProject.findProject(pid.projectPath)
                                         if (subproject != null && subproject != p) {
-                                            def subArtifactId = subproject.findProperty('archivesBaseName') ?:
-                                                (subproject.pluginManager.hasPlugin('base') ? subproject.base.archivesName.get() : subproject.name)
+                                            def subPub = subproject.extensions.findByType(PublishingExtension)?.publications?.findByName('javaMaven') as MavenPublication
+                                            def subArtifactId = subPub?.artifactId ?: (subproject.pluginManager.hasPlugin('base') ? subproject.base.archivesName.orNull : subproject.name)
                                             def subGroup = subproject.group?.toString() ?: p.group.toString()
                                             def subVersion = subproject.version?.toString() ?: p.version.toString()
                                             def coordKey = "${subGroup}:${subArtifactId}"
@@ -245,7 +283,6 @@ gradle.allprojects { p ->
                                                 depNode.appendNode('version', subVersion)
                                                 depNode.appendNode('scope', 'runtime')
 
-                                                // Preserve declared exclusions
                                                 def projDep = (p.configurations.findByName('testImplementation')?.dependencies?.withType(ProjectDependency) ?: [])
                                                     .find { it.path == subproject.path }
                                                 if (projDep != null && !projDep.excludeRules.isEmpty()) {
@@ -255,6 +292,11 @@ gradle.allprojects { p ->
                                                         exclNode.appendNode('groupId', rule.group ?: '*')
                                                         exclNode.appendNode('artifactId', rule.module ?: '*')
                                                     }
+                                                } else {
+                                                    def exclusionsNode = depNode.appendNode('exclusions')
+                                                    def exclNode = exclusionsNode.appendNode('exclusion')
+                                                    exclNode.appendNode('groupId', '*')
+                                                    exclNode.appendNode('artifactId', '*')
                                                 }
                                             }
                                         }
@@ -273,7 +315,7 @@ gradle.allprojects { p ->
 gradle.projectsEvaluated {
     gradle.allprojects { p ->
         if (!p.pluginManager.hasPlugin('java')) return
-        if (p.name.endsWith('-starter') || p.name.endsWith('-test') || (p.name.endsWith('-app') && p.name != 'cryptocollector-app')) return
+        if (p.name.endsWith('-starter') || p.name.endsWith('-test') || p.name.endsWith('-app')) return
         if (!p.subprojects.isEmpty()) return
 
         def runtimeClasspath = p.configurations.findByName('runtimeClasspath')
@@ -294,50 +336,63 @@ gradle.projectsEvaluated {
         rootDeps.each { depResult ->
             if (!(depResult instanceof ResolvedDependencyResult)) return
             def resolvedDep = depResult as ResolvedDependencyResult
-            def selected = resolvedDep.selected
+            if (resolvedDep.constraint) return
 
+            def selected = resolvedDep.selected
             if (selected.id instanceof ProjectComponentIdentifier) return
 
             def depGroup = selected.moduleVersion?.group ?: ''
             if (!depGroup.startsWith('ru.thedevs')) return
+
+            def depName = selected.moduleVersion?.name ?: ''
+            if (depName.endsWith('-test') || depName.endsWith('-app')) return
 
             boolean isPlatform = selected.variants.any { v ->
                 try {
                     def cat = v.attributes.getAttribute(Category.CATEGORY_ATTRIBUTE)
                     return cat != null && (cat.name == Category.REGULAR_PLATFORM ||
                                            cat.name == Category.ENFORCED_PLATFORM)
-                } catch (Throwable ignored) {
+                } catch (Exception ignored) {
                     return false
                 }
             }
             if (isPlatform) return
 
-            def depName = selected.moduleVersion?.name ?: ''
             def depVersion = selected.moduleVersion?.version ?: ''
 
-            // Starter mapping: inspect outgoing dependencies
             String baseModule = depName
+            String baseGroup = depGroup
+            String baseVersion = depVersion
+
+            // Starter mapping: inspect outgoing dependencies
             if (depName.endsWith('-starter')) {
                 def childDep = selected.dependencies.find { childResult ->
                     if (childResult instanceof ResolvedDependencyResult) {
                         def childSelected = (childResult as ResolvedDependencyResult).selected
                         def childGroup = childSelected.moduleVersion?.group ?: ''
                         def childName = childSelected.moduleVersion?.name ?: ''
-                        return childGroup.startsWith('ru.thedevs') &&
+                        def childVer = childSelected.moduleVersion?.version ?: ''
+                        return childGroup == depGroup &&
+                               childVer == depVersion &&
                                !childName.endsWith('-starter') &&
                                !childName.endsWith('-bom') &&
-                               !childName.endsWith('-platform')
+                               !childName.endsWith('-platform') &&
+                               !childName.endsWith('-test') &&
+                               !childName.endsWith('-app')
                     }
                     return false
                 }
                 if (childDep != null) {
-                    baseModule = ((childDep as ResolvedDependencyResult).selected.moduleVersion.name)
+                    def childMv = (childDep as ResolvedDependencyResult).selected.moduleVersion
+                    baseGroup = childMv.group
+                    baseModule = childMv.name
+                    baseVersion = childMv.version
                 } else {
                     baseModule = depName.substring(0, depName.length() - '-starter'.length())
                 }
             }
 
-            candidateAddons.add([group: depGroup, baseModule: baseModule, version: depVersion])
+            candidateAddons.add([group: baseGroup, baseModule: baseModule, version: baseVersion])
         }
 
         candidateAddons.each { addon ->
@@ -348,10 +403,10 @@ gradle.projectsEvaluated {
             // 1. Create configuration addonTestClasspath_${baseModule}
             def confName = "addonTestClasspath_${baseModule}"
             def addonTestClasspath = p.configurations.maybeCreate(confName)
+            addonTestClasspath.canBeConsumed = false
+            addonTestClasspath.canBeResolved = true
             addonTestClasspath.transitive = true
-            try {
-                addonTestClasspath.shouldResolveConsistentlyWith(runtimeClasspath)
-            } catch (Throwable ignored) {}
+            addonTestClasspath.shouldResolveConsistentlyWith(runtimeClasspath)
             p.dependencies.add(confName, "${depGroup}:${baseModule}-tests:${depVersion}")
 
             def testTaskName = "testAddon_${baseModule}"
@@ -365,6 +420,21 @@ gradle.projectsEvaluated {
             def aggregateFile = p.layout.buildDirectory.file("addon-tests/${baseModule}/aggregate-changelog.xml").get().asFile
 
             def unpackTask = p.tasks.maybeCreate(unpackTaskName)
+            unpackTask.inputs.files(addonTestClasspath.incoming.artifactView {
+                lenient(true)
+            }.files)
+            unpackTask.inputs.files({
+                def hc = resolveHostMainLiquibaseChangelog(p)
+                (hc != null && hc.file != null) ? p.files(hc.file) : p.files()
+            })
+            unpackTask.inputs.property("strictMode", {
+                (p.findProperty('thedevs.tests.strict') == 'true') ||
+                (p.providers.gradleProperty('thedevs.tests.strict').orNull == 'true') ||
+                (System.getenv('THEDEVS_TESTS_STRICT') == 'true')
+            })
+            unpackTask.inputs.property("hostChangelog", {
+                resolveHostMainLiquibaseChangelog(p)?.path ?: ''
+            })
             unpackTask.outputs.dir(classesDir)
             unpackTask.outputs.file(aggregateFile)
 
@@ -375,31 +445,69 @@ gradle.projectsEvaluated {
                 aggregateFile.parentFile.mkdirs()
 
                 def isStrict = (p.findProperty('thedevs.tests.strict') == 'true') ||
-                               (p.providers.gradleProperty('thedevs.tests.strict').orNull == 'true')
+                               (p.providers.gradleProperty('thedevs.tests.strict').orNull == 'true') ||
+                               (System.getenv('THEDEVS_TESTS_STRICT') == 'true')
 
                 def lenient = addonTestClasspath.resolvedConfiguration.lenientConfiguration
                 def unresolved = lenient.unresolvedModuleDependencies
 
+                // Match strictly the root selector
                 def rootUnresolved = unresolved.find {
-                    def str = it.selector?.toString() ?: ''
-                    if (str.startsWith("${depGroup}:${baseModule}-tests")) {
-                        return true
-                    }
-                    def g = it.selector.hasProperty('group') ? it.selector.group : null
-                    def n = it.selector.hasProperty('name') ? it.selector.name : (it.selector.hasProperty('module') ? it.selector.module : null)
-                    return g == depGroup && (n == "${baseModule}-tests" || n == "${baseModule}")
+                    def sel = it.selector
+                    def g = sel.hasProperty('group') ? sel.group : null
+                    def n = sel.hasProperty('name') ? sel.name : (sel.hasProperty('module') ? sel.module : null)
+                    def v = sel.hasProperty('version') ? sel.version : null
+                    return g == depGroup && n == "${baseModule}-tests" && v == depVersion
                 }
 
                 if (rootUnresolved != null) {
                     def prob = rootUnresolved.problem
-                    def msg = prob?.message ?: ''
-                    if (msg.contains("Connection refused") || msg.contains("timed out") || msg.contains("Timeout") ||
-                        msg.contains("401") || msg.contains("403") || msg.contains("500") || msg.contains("502") || msg.contains("503")) {
-                        throw new GradleException("[TD-2039] Network or repository error resolving '${depGroup}:${baseModule}-tests:${depVersion}': ${msg}", prob)
+                    // Check cause chain for network / auth errors
+                    def allCauses = []
+                    def cur = prob
+                    while (cur != null && !allCauses.contains(cur)) {
+                        allCauses.add(cur)
+                        cur = cur.cause
+                    }
+
+                    boolean isNetworkOrAuthError = allCauses.any { t ->
+                        def cName = t.class.name
+                        def cMsg = t.message ?: ''
+                        return cName.contains("HttpError") ||
+                               cName.contains("HttpResponseException") ||
+                               cName.contains("ConnectException") ||
+                               cName.contains("SocketException") ||
+                               cName.contains("SocketTimeoutException") ||
+                               cName.contains("UnknownHostException") ||
+                               cName.contains("SSLException") ||
+                               cMsg.contains("401 Unauthorized") ||
+                               cMsg.contains("403 Forbidden") ||
+                               cMsg.contains("500 Internal") ||
+                               cMsg.contains("502 Bad Gateway") ||
+                               cMsg.contains("503 Service") ||
+                               cMsg.contains("504 Gateway") ||
+                               cMsg.contains("Connection refused") ||
+                               cMsg.contains("timed out")
+                    }
+
+                    if (isNetworkOrAuthError) {
+                        throw new GradleException("[TD-2039] Network or repository error resolving '${depGroup}:${baseModule}-tests:${depVersion}': ${prob?.message}", prob)
+                    }
+
+                    boolean isNotFound = allCauses.any { t ->
+                        def cName = t.class.name
+                        def cMsg = t.message ?: ''
+                        return cName.contains("ModuleVersionNotFoundException") ||
+                               cMsg.startsWith("Could not find ${depGroup}:${baseModule}-tests") ||
+                               cMsg.startsWith("Could not find ")
+                    }
+
+                    if (!isNotFound) {
+                        throw new GradleException("[TD-2039] Resolution error for '${depGroup}:${baseModule}-tests:${depVersion}': ${prob?.message}", prob)
                     }
 
                     if (isStrict) {
-                        throw new GradleException("[TD-2039] Strict mode enabled (-Pthedevs.tests.strict=true): tests artifact '${depGroup}:${baseModule}-tests:${depVersion}' was not found. Tests artifact must be published or the build fails.")
+                        throw new GradleException("[TD-2039] Strict mode enabled: tests artifact '${depGroup}:${baseModule}-tests:${depVersion}' was not found. Tests artifact must be published or marked with thedevs.tests.disabled=true in the descriptor.")
                     } else {
                         println "::warning::[TD-2039] Skipped dependency tests for '${depGroup}:${baseModule}': tests artifact not yet published (pre-rollout)."
                         testState.skippedPreRollout = true
@@ -427,7 +535,8 @@ gradle.projectsEvaluated {
                     }
                 }
 
-                p.copy {
+                // Sync classes cleanly to eliminate stale files
+                p.sync {
                     from p.zipTree(testsJarArtifact.file)
                     into classesDir
                 }
@@ -445,13 +554,24 @@ gradle.projectsEvaluated {
                 }
 
                 def depChangelog = depProps.getProperty('thedevs.test.liquibase.change-log') ?: depProps.getProperty('main.liquibase.change-log')
-                def hostChangelog = resolveProjectLiquibaseChangelog(p)
+                def hostChangelogInfo = resolveHostMainLiquibaseChangelog(p)
+                def hostChangelog = hostChangelogInfo?.path
+                def hostChangelogFile = hostChangelogInfo?.file
 
                 if (depChangelog == null) {
                     println "::warning::[TD-2039] Could not determine Liquibase changelog for dependency '${baseModule}'"
                 }
                 if (hostChangelog == null) {
                     println "::warning::[TD-2039] Could not determine host Liquibase changelog for project '${p.path}'"
+                }
+
+                boolean hostAlreadyIncludesDep = false
+                if (hostChangelogFile != null && hostChangelogFile.exists() && depChangelog != null) {
+                    def hostText = hostChangelogFile.text
+                    def depNorm = depChangelog.startsWith('/') ? depChangelog.substring(1) : depChangelog
+                    if (hostText.contains(depChangelog) || hostText.contains(depNorm) || hostText.contains("/" + depNorm)) {
+                        hostAlreadyIncludesDep = true
+                    }
                 }
 
                 def xmlBuilder = new StringBuilder()
@@ -462,10 +582,10 @@ gradle.projectsEvaluated {
                 xmlBuilder.append('    xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog\n')
                 xmlBuilder.append('        http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-latest.xsd">\n')
 
-                if (depChangelog != null) {
+                if (depChangelog != null && !hostAlreadyIncludesDep) {
                     xmlBuilder.append("    <include file=\"${depChangelog}\" relativeToChangelogFile=\"false\"/>\n")
                 }
-                if (hostChangelog != null && hostChangelog != depChangelog) {
+                if (hostChangelog != null) {
                     xmlBuilder.append("    <include file=\"${hostChangelog}\" relativeToChangelogFile=\"false\"/>\n")
                 }
                 xmlBuilder.append('</databaseChangeLog>\n')
@@ -476,7 +596,12 @@ gradle.projectsEvaluated {
             testAddon.dependsOn(unpackTask)
             testAddon.testClassesDirs = p.files(classesDir)
 
-            def starterProject = p.rootProject.subprojects.find { it.name.endsWith('-starter') }
+            def starterProject = p.rootProject.subprojects.find { sp ->
+                sp.name.endsWith('-starter') && sp.configurations.any { c ->
+                    c.dependencies.any { d -> (d instanceof ProjectDependency) && (d.path == p.path || d.name == p.name) }
+                }
+            } ?: p.rootProject.subprojects.find { it.name == "${p.name}-starter" } ?:
+                 p.rootProject.subprojects.find { it.name.endsWith('-starter') }
             def starterMainOutput = (starterProject != null && starterProject.pluginManager.hasPlugin('java')) ?
                 starterProject.sourceSets.main.output : p.files()
 
@@ -491,7 +616,9 @@ gradle.projectsEvaluated {
                        runtimeClasspath
             })
 
-            testAddon.useJUnitPlatform()
+            testAddon.useJUnitPlatform {
+                excludeTags 'hsql-pending'
+            }
             testAddon.failOnNoDiscoveredTests = false
             testAddon.filter.failOnNoMatchingTests = false
 
@@ -514,16 +641,10 @@ gradle.projectsEvaluated {
                             testAddon.systemProperty(sysProp, v)
                         }
                     }
-                    def excludeTags = depProps.getProperty('thedevs.test.excludeTags')
-                    if (excludeTags) {
-                        testAddon.useJUnitPlatform {
-                            it.excludeTags(excludeTags.split(',').collect { t -> t.trim() } as String[])
-                        }
-                    }
                 }
 
-                testAddon.systemProperty('main.liquibase.change-log', aggregateFile.absolutePath)
-                testAddon.systemProperty('spring.liquibase.change-log', aggregateFile.absolutePath)
+                testAddon.systemProperty('main.liquibase.change-log', 'classpath:aggregate-changelog.xml')
+                testAddon.systemProperty('spring.liquibase.change-log', 'classpath:aggregate-changelog.xml')
                 testAddon.systemProperty('liquibase.duplicateFileMode', 'WARN')
             }
 

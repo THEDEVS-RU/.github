@@ -27,6 +27,7 @@ rootProject.name = 'addon-upstream'
 include 'itink-mod'
 include 'upstream-starter'
 include 'helper-test'
+include 'sample-lib'
 EOF
 
 cat > "$UPSTREAM_DIR/build.gradle" <<'EOF'
@@ -53,11 +54,21 @@ cat > "$UPSTREAM_DIR/itink-mod/src/test/java/ru/thedevs/itink/ItinkTest.java" <<
 package ru.thedevs.itink;
 import org.junit.jupiter.api.Test;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class ItinkTest {
     @Test
     void testItinkService() {
         assertEquals("hello from itink", new ItinkService().message());
+        String changelog = System.getProperty("main.liquibase.change-log");
+        assertNotNull(changelog, "main.liquibase.change-log must be set");
+        assertTrue(changelog.startsWith("classpath:") || changelog.startsWith("file:"), "changelog must have classpath: or file: prefix");
+        if (changelog.startsWith("classpath:")) {
+            String res = changelog.substring("classpath:".length());
+            while (res.startsWith("/")) res = res.substring(1);
+            assertNotNull(getClass().getClassLoader().getResource(res), "Changelog resource must be resolvable via ClassLoader: " + res);
+        }
     }
 }
 EOF
@@ -163,10 +174,42 @@ publishing {
 }
 EOF
 
+# sample-lib: library published without tests (used to test strict vs pre-rollout)
+mkdir -p "$UPSTREAM_DIR/sample-lib/src/main/java/ru/thedevs/sample"
+cat > "$UPSTREAM_DIR/sample-lib/src/main/java/ru/thedevs/sample/Sample.java" <<'EOF'
+package ru.thedevs.sample;
+public class Sample {
+    public static String get() { return "sample"; }
+}
+EOF
+
+cat > "$UPSTREAM_DIR/sample-lib/build.gradle" <<EOF
+plugins {
+    id 'java'
+    id 'maven-publish'
+}
+publishing {
+    publications {
+        javaMaven(MavenPublication) {
+            from components.java
+        }
+    }
+    repositories {
+        maven {
+            name = 'localRepo'
+            url = uri("${REPO_DIR}")
+        }
+    }
+}
+EOF
+
 echo "Building and publishing upstream fixtures via ci-addon-tests.init.gradle..."
 (
   cd "$UPSTREAM_DIR"
-  gradle -I "$INIT_SCRIPT" publishAllPublicationsToLocalRepoRepository --no-daemon
+  # Publish itink-mod, upstream-starter, helper-test via ci-addon-tests.init.gradle
+  gradle -I "$INIT_SCRIPT" :itink-mod:publishAllPublicationsToLocalRepoRepository :upstream-starter:publishAllPublicationsToLocalRepoRepository :helper-test:publishAllPublicationsToLocalRepoRepository --no-daemon
+  # Publish sample-lib WITHOUT init script so it has NO -tests artifact published
+  gradle :sample-lib:publishAllPublicationsToLocalRepoRepository --no-daemon
 )
 
 # 2. Validate Published Artifacts and POM
@@ -290,9 +333,16 @@ public class ConsumerTest {
 }
 EOF
 
-mkdir -p "$DOWNSTREAM_DIR/consumer-mod/src/test/resources"
-cat > "$DOWNSTREAM_DIR/consumer-mod/src/test/resources/test-consumer.properties" <<'EOF'
-main.liquibase.change-log=ru/thedevs/consumer/liquibase/changelog.xml
+# Host changelog in main resources (not test resources!)
+mkdir -p "$DOWNSTREAM_DIR/consumer-mod/src/main/resources/ru/thedevs/consumer/liquibase"
+cat > "$DOWNSTREAM_DIR/consumer-mod/src/main/resources/ru/thedevs/consumer/liquibase/changelog.xml" <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog
+    xmlns="http://www.liquibase.org/xml/ns/dbchangelog"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog
+        http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-latest.xsd">
+</databaseChangeLog>
 EOF
 
 cat > "$DOWNSTREAM_DIR/consumer-mod/build.gradle" <<'EOF'
@@ -369,55 +419,25 @@ if [ ! -f "$UNPACKED_TEST_CLASS" ]; then
   exit 1
 fi
 
-# Verify test results generated in isolated folder
-TEST_RESULTS_DIR="$DOWNSTREAM_DIR/consumer-mod/build/test-results/testAddon_itink"
-if [ ! -d "$TEST_RESULTS_DIR" ]; then
-  echo "FAIL: Isolated test results directory not found at $TEST_RESULTS_DIR" >&2
+# Verify test report confirms actual execution (tests="1", failures="0", errors="0")
+REPORT_FILE="$DOWNSTREAM_DIR/consumer-mod/build/test-results/testAddon_itink/TEST-ru.thedevs.itink.ItinkTest.xml"
+if [ ! -f "$REPORT_FILE" ]; then
+  echo "FAIL: Test report file not found at $REPORT_FILE" >&2
+  exit 1
+fi
+
+if ! grep -q 'tests="1"' "$REPORT_FILE" || ! grep -q 'failures="0"' "$REPORT_FILE" || ! grep -q 'errors="0"' "$REPORT_FILE"; then
+  echo "FAIL: Test report does not indicate exactly 1 passing test without failures or errors" >&2
+  cat "$REPORT_FILE" >&2
   exit 1
 fi
 
 echo "Downstream testAddon execution validation: PASSED"
 
 # 5. Validate Strict Mode vs Pre-rollout for missing tests artifact
-echo "Testing strict mode vs pre-rollout mode behavior..."
+# We verify in the SAME directory that switching to strict mode invalidates UP-TO-DATE and fails.
+echo "Testing strict mode vs pre-rollout mode behavior in same consumer directory..."
 
-PRE_TEST_DIR="$TEST_DIR/prerollout-consumer"
-mkdir -p "$PRE_TEST_DIR"
-cat > "$PRE_TEST_DIR/settings.gradle" <<'EOF'
-rootProject.name = 'prerollout-consumer'
-EOF
-cat > "$PRE_TEST_DIR/build.gradle" <<EOF
-plugins {
-    id 'java'
-}
-repositories {
-    maven { url = uri("${REPO_DIR}") }
-    mavenCentral()
-}
-dependencies {
-    implementation 'ru.thedevs:helper-test:1.0.0'
-}
-EOF
-
-# In pre-rollout mode (default), missing tests artifact prints warning and succeeds
-set +e
-PRE_ROLLOUT_OUTPUT=$(cd "$PRE_TEST_DIR" && gradle -I "$INIT_SCRIPT" testAddonDependencies --no-daemon 2>&1)
-PRE_RC=$?
-set -e
-
-if [ "$PRE_RC" -ne 0 ]; then
-  echo "FAIL: Build failed in pre-rollout mode with exit code $PRE_RC (expected success with warning)" >&2
-  echo "$PRE_ROLLOUT_OUTPUT" >&2
-  exit 1
-fi
-
-if ! echo "$PRE_ROLLOUT_OUTPUT" | grep -q "Skipped dependency tests for 'ru.thedevs:helper-test'"; then
-  echo "FAIL: Pre-rollout warning not printed for missing tests artifact" >&2
-  echo "$PRE_ROLLOUT_OUTPUT" >&2
-  exit 1
-fi
-
-# In strict mode (-Pthedevs.tests.strict=true), missing tests artifact must fail
 STRICT_TEST_DIR="$TEST_DIR/strict-consumer"
 mkdir -p "$STRICT_TEST_DIR"
 cat > "$STRICT_TEST_DIR/settings.gradle" <<'EOF'
@@ -432,17 +452,36 @@ repositories {
     mavenCentral()
 }
 dependencies {
-    implementation 'ru.thedevs:helper-test:1.0.0'
+    implementation 'ru.thedevs:sample-lib:1.0.0'
 }
 EOF
 
+# In pre-rollout mode (default), missing tests artifact prints warning and succeeds
+set +e
+PRE_ROLLOUT_OUTPUT=$(cd "$STRICT_TEST_DIR" && gradle -I "$INIT_SCRIPT" testAddonDependencies --no-daemon 2>&1)
+PRE_RC=$?
+set -e
+
+if [ "$PRE_RC" -ne 0 ]; then
+  echo "FAIL: Build failed in pre-rollout mode with exit code $PRE_RC (expected success with warning)" >&2
+  echo "$PRE_ROLLOUT_OUTPUT" >&2
+  exit 1
+fi
+
+if ! echo "$PRE_ROLLOUT_OUTPUT" | grep -q "Skipped dependency tests for 'ru.thedevs:sample-lib'"; then
+  echo "FAIL: Pre-rollout warning not printed for missing tests artifact" >&2
+  echo "$PRE_ROLLOUT_OUTPUT" >&2
+  exit 1
+fi
+
+# In strict mode (-Pthedevs.tests.strict=true), missing tests artifact must fail in the SAME directory
 set +e
 STRICT_OUTPUT=$(cd "$STRICT_TEST_DIR" && gradle -I "$INIT_SCRIPT" testAddonDependencies -Pthedevs.tests.strict=true --no-daemon 2>&1)
 STRICT_RC=$?
 set -e
 
 if [ "$STRICT_RC" -eq 0 ]; then
-  echo "FAIL: Build succeeded in strict mode with missing tests artifact, but must fail!" >&2
+  echo "FAIL: Build succeeded in strict mode with missing tests artifact in same directory, but must fail!" >&2
   echo "$STRICT_OUTPUT" >&2
   exit 1
 fi
@@ -453,6 +492,6 @@ if ! echo "$STRICT_OUTPUT" | grep -q "Strict mode enabled"; then
   exit 1
 fi
 
-echo "Strict mode vs pre-rollout behavior: PASSED"
+echo "Strict mode vs pre-rollout behavior in same directory: PASSED"
 
 echo "=== All Contract Tests for setup-addon-tests PASSED ==="

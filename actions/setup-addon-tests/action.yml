@@ -1,6 +1,12 @@
 name: 'Setup Addon Tests Environment'
 description: 'Provides canonical ci-addon-tests.init.gradle and configures test dependency execution environment'
 
+inputs:
+  strict:
+    description: 'Enforce strict mode for dependency tests'
+    required: false
+    default: 'false'
+
 outputs:
   init_script:
     description: 'Absolute path to canonical ci-addon-tests.init.gradle'
@@ -20,4 +26,7 @@ runs:
         fi
         echo "init_script=$SCRIPT_PATH" >> "$GITHUB_OUTPUT"
         echo "THEDEVS_ADDON_TESTS_INIT=$SCRIPT_PATH" >> "$GITHUB_ENV"
+        if [ "${{ inputs.strict }}" = "true" ] || [ "${{ env.THEDEVS_TESTS_STRICT }}" = "true" ]; then
+          echo "THEDEVS_TESTS_STRICT=true" >> "$GITHUB_ENV"
+        fi
         echo "Canonical addon tests init script located at: $SCRIPT_PATH"
