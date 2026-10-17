@@ -13,38 +13,52 @@ impl_effort: high
 # Контракт
 
 - **Consumes**:
-  1. `actions/kaniko-build` из `THEDEVS-RU/.github@dev` с поддержкой входных параметров `cpu_limit`, `extra_tags` и `build_args`, реализованных в спецификации `2026-10-17-kaniko-build-cpu-limit-and-build-args` (TD-2197).
+  1. `actions/kaniko-build` из `THEDEVS-RU/.github@dev` с поддержкой входных параметров `cpu_limit`, `extra_tags` и `build_args` per `2026-10-17-kaniko-build-cpu-limit-and-build-args` (TD-2197).
   2. K8s Secret `thedevs-registry-secret` (тип `kubernetes.io/dockerconfigjson`) в namespace `dev` для авторизации в корпоративном реестре `registry.thedevs.ru`.
-  3. Согласованное решение оператора (раунд 1 ревью TD-2197 от 2026-10-17 22:59) о разделении базового стека на 3 слоя (`thedevs-core` -> `thedevs-ai` -> `thedevs-browser`) и выносе сборочного пайплайна в выделенный приватный репозиторий `THEDEVS-RU/base-images`.
+  3. Предварительные условия bootstrap оператора: созданный приватный репозиторий `THEDEVS-RU/base-images`, дефолтная ветка `dev`, группа self-hosted раннеров `master`, доступ к org-секретам `BUILDER_CONFIG_K8S`, `DOCKERHUB_USERNAME`, `DOCKERHUB_TOKEN`.
 - **Produces**:
-  1. Приватный репозиторий `THEDEVS-RU/base-images` со структурой Dockerfile для 3 слоев Lego-стека и манифестом K8s PVC кэша `k8s/pvc-cache.yaml`.
-  2. CI-пайплайн `.github/workflows/build-base-images.yml` на self-hosted раннере `master` с регулярной сборкой (cron по воскресеньям в 03:00 UTC), ручным запуском (`workflow_dispatch`), вычислением тегов в resolve-джобе, каскадной пересборкой зависимых слоев и тегированием (`latest`, `<branch>`, `<branch>-YYYYMMDD-<run>`).
-  3. Опубликованные базовые Docker-образы в `registry.thedevs.ru/thedevs-ru/thedevs-{core,ai,browser}` (внутреннее имя `registry.container-registry.svc.cluster.local:5000/thedevs-ru/thedevs-{core,ai,browser}`).
-  4. Контракт перевода проектов платформы (`shield-3`, `thedevslk`, `mobitrack-2`, `TemplateProject`, `marta`, `flparser`) на базовые слои через дочерние задачи.
+  1. Репозиторий `THEDEVS-RU/base-images` со структурой Dockerfile для 3 слоев Lego-стека (`thedevs-core` -> `thedevs-ai` -> `thedevs-browser`) и манифестом K8s PVC кэша `k8s/pvc-cache.yaml` (10Gi).
+  2. CI-пайплайн `.github/workflows/build-base-images.yml` на self-hosted раннере `master` с регулярной сборкой (cron по воскресеньям в 03:00 UTC на дефолтной ветке `dev`), ручным запуском (`workflow_dispatch`), расчетом тегов в resolve-джобе, каскадной пересборкой зависимых слоев и сборкой тегов `dev`, `<branch>-YYYYMMDD-<run>`.
+  3. Пайплайн продвижения `.github/workflows/promote-base-images.yml` для перетегирования проверенного digest в `master` и `latest` через `skopeo copy` без повторной сборки.
+  4. Опубликованные базовые Docker-образы в `registry.thedevs.ru/thedevs-ru/thedevs-{core,ai,browser}` (внутреннее имя `registry.container-registry.svc.cluster.local:5000/thedevs-ru/thedevs-{core,ai,browser}`).
+  5. Контракт перевода проектов платформы (`shield-3`, `thedevslk`, `mobitrack-2`, `TemplateProject`, `marta`/`flparser`) на базовые слои через дочерние задачи (`TD-2204`–`TD-2208`).
 
 # Контекст
 
 В микросервисах платформы TheDevs (`thedevslk`, `shield-3`, `mobitrack-2`, `marta`, `flparser`, `TemplateProject`) в каждом `Dockerfile` дублируется ручная установка системных пакетов, JRE, Node.js, утилит командной строки CoreAI и браузеров. Это приводит к разрастанию времени сборки (до 4–8 минут), дублированию уязвимостей, расхождению версий и повторной загрузке сотен мегабайт внешних зависимостей.
 
 Фактическое состояние экосистемы (проверяемые факты):
-1. **Версии PostgreSQL серверов**:
+1. **Версии PostgreSQL серверов и клиента**:
    - `postgres-service.default.svc.cluster.local:5432` отдаёт `PostgreSQL 16.10 (Debian 16.10-1.pgdg13+1)`.
-   - `addon-core@dev:core/src/main/java/ru/thedevs/backup/target/PgDumpBackupTarget.java:94-99` требует строго `clientMajorVersion >= serverMajorVersion`. Фиксация `ARG PG_CLIENT_MAJOR=17` в `thedevs-core` обеспечивает `17 >= 16`, гарантируя совместимость с текущими серверами кластера и будущими обновлениями до PostgreSQL 17.
+   - `addon-core@dev:core/src/main/java/ru/thedevs/backup/target/PgDumpBackupTarget.java:94-99` требует строго `clientMajorVersion >= serverMajorVersion`. Фиксация `ARG PG_CLIENT_MAJOR=18` в `thedevs-core` (репозиторий `noble-pgdg` предоставляет пакет `postgresql-client-18`) обеспечивает `18 >= 16`, гарантируя совместимость с текущими серверами кластера и будущими релизами PostgreSQL 17 и 18.
 2. **Версии Playwright**:
-   - `THEDEVS-RU/addon-browser@dev:gradle/libs.versions.toml:4` фиксирует `playwright = "1.58.0"`.
-   - `THEDEVS-RU/marta@dev:Dockerfile.base:48` устанавливает `playwright@1.58.0`.
-   - `THEDEVS-RU/thedevslk@dev:Dockerfile:185` содержал устаревший комментарий про 1.52.0. Требуется единый стандарт `1.58.0` с установкой как Chromium, так и Firefox (`--with-deps`), так как парсеры `flparser` активно используют Firefox (`FlRuParserActionHandler`, `FreelanceRuParserActionHandler`, `KworkParserActionHandler`).
+   - `THEDEVS-RU/addon-browser@dev:gradle/libs.versions.toml:4` фиксирует `playwright = "1.58.0"`. Снятие устаревшего принудительного `force = "1.52.0"` вынесено в задачу `TD-2211`.
+   - `thedevs-browser` запекает Chromium и Firefox версии `1.58.0` с установкой системных библиотек через Playwright CLI.
 3. **Память и лимиты подов**:
    - `kubectl get deployment -n dev`: `flparser` (limits.memory 6Gi), `thedevslk` (limits.memory 10Gi), `shield` (limits.memory 20Gi), `mobitrack` (limits.memory 3Gi).
-   - Включение дефолтных флагов `JAVA_TOOL_OPTIONS` (например `-XX:MaxRAMPercentage=80`) в базовом образе опасно: рядом с Chromium/Firefox и Node.js процессами 80% памяти под кучу JVM приводит к OOMKilled (у `flparser` лимит 6Gi). Базовый образ обязан быть свободным от флагов памяти JVM; настройки памяти передаются исключительно через переменные окружения деплойментов.
+   - Базовый образ полностью свободен от дефолтных флагов памяти JVM (отсутствует `JAVA_TOOL_OPTIONS`). Настройки памяти передаются строго через переменные окружения деплойментов (`deployment-shield-dev.yaml` сохраняет `-XX:MaxRAMPercentage=85` и сервисные GC-флаги).
 4. **Сетевые политики и безопасность**:
-   - `kubectl get networkpolicy -n dev` возвращает `No resources found in dev namespace.` Утверждения о наличии защитных NetworkPolicy в dev являются ложными. Требуется честная модель угроз.
+   - `kubectl get networkpolicy -n dev` возвращает `No resources found in dev namespace.` Утверждения о наличии защитных NetworkPolicy в dev являются ложными. Блокировка исходящего UDP и WebRTC утечек оформлена в задачу `TD-2210`.
 5. **Инфраструктура Kaniko**:
-   - `kubectl get pvc -n dev` подтверждает отсутствие тома `kaniko-cache-thedevs-base`. Сборка зависает в `Pending` до таймаута без явного создания PVC.
+   - `kubectl get pvc -n dev` подтверждает отсутствие тома `kaniko-cache-thedevs-base`. Сборка зависает в `Pending` до таймаута без явного создания PVC. В манифесте фиксируется объем `10Gi`.
+6. **Gemini CLI**:
+   - Закрыт Google 18.06.2026. Исключен из `thedevs-ai`. Аудит и миграция раннеров в `thedevslk` и `addon-core-ai` вынесены в задачу `TD-2212`.
+7. **Структура marta и flparser**:
+   - Оба сервиса размещены в едином репозитории `THEDEVS-RU/marta` (деплойменты `marta` и `flparser`). Перевод обоих сервисов с упразднением `marta-base` оформлен в задачу `TD-2208`.
+8. **Каскадное продвижение и cron**:
+   - GitHub cron запускается строго на дефолтной ветке `dev`. Ветка `master` не пересобирает образы, а продвигает проверенный digest из `dev` перетегированием через `skopeo copy`.
 
 # Что сделать
 
-## 1. Структура репозитория THEDEVS-RU/base-images
+## 1. Подготовительные действия оператора (Bootstrap)
+
+До первого запуска пайплайна оператор выполняет разовые действия:
+1. Создает приватный репозиторий `THEDEVS-RU/base-images`.
+2. Устанавливает ветку по умолчанию `dev`.
+3. Назначает репозиторию группу self-hosted раннеров `master`.
+4. Предоставляет репозиторию доступ к org-секретам `BUILDER_CONFIG_K8S`, `DOCKERHUB_USERNAME`, `DOCKERHUB_TOKEN`.
+
+## 2. Структура репозитория THEDEVS-RU/base-images
 
 Создать в репозитории `THEDEVS-RU/base-images`:
 - `docker/thedevs-core/Dockerfile`
@@ -52,9 +66,10 @@ impl_effort: high
 - `docker/thedevs-browser/Dockerfile`
 - `k8s/pvc-cache.yaml`
 - `.github/workflows/build-base-images.yml`
+- `.github/workflows/promote-base-images.yml`
 - `README.md`
 
-## 2. Слой thedevs-core (`docker/thedevs-core/Dockerfile`)
+## 3. Слой thedevs-core (`docker/thedevs-core/Dockerfile`)
 
 Базовый образ платформы для серверных Java-приложений без AI-раннеров (`mobitrack-2`, `TemplateProject`):
 - База: `eclipse-temurin:25-jre-noble` (Ubuntu 24.04 LTS).
@@ -62,19 +77,20 @@ impl_effort: high
   `groupadd -g 1000 appuser && useradd -u 1000 -g appuser -m -s /bin/bash appuser`.
 - Переключение зеркал на `ru.archive.ubuntu.com` для deb822 (`/etc/apt/sources.list.d/ubuntu.sources`) и классического формата.
 - Системный стек: `ca-certificates`, `curl`, `git`, `jq`, `tini`, `locales` (`ENV LANG=C.UTF-8`, `ENV LC_ALL=C.UTF-8`), `fontconfig`, `fonts-dejavu-core`, `fonts-liberation`.
-- PostgreSQL клиент: официальный репозиторий PGDG `noble-pgdg` с установкой ключа в `/etc/apt/keyrings/postgresql.gpg` (без устаревшего apt-key) и фиксированным аргументом `ARG PG_CLIENT_MAJOR=17`.
+- PostgreSQL клиент: официальный репозиторий PGDG `noble-pgdg` с установкой ключа в `/etc/apt/keyrings/postgresql.gpg` (без устаревшего apt-key) и фиксированным аргументом `ARG PG_CLIENT_MAJOR=18`.
 - Проверка версий на этапе сборки:
-  `git --version && jq --version && curl --version && /usr/bin/tini --version && pg_dump --version | grep -E " ${PG_CLIENT_MAJOR}\."`
+  `git --version && jq --version && curl --version && /usr/bin/tini --version && pg_dump --version | grep -E " (18\.|18 )"`
 - `WORKDIR /app`, `chown -R 1000:1000 /app`.
 - Отсутствие дефолтных флагов кучи JVM в `JAVA_TOOL_OPTIONS`.
 - `ENTRYPOINT ["/usr/bin/tini", "--"]`.
 - `ARG CACHEBUST=0` для управляемой инвалидации кэша слоев при обновлениях безопасности.
 
-## 3. Слой thedevs-ai (`docker/thedevs-ai/Dockerfile`)
+## 4. Слой thedevs-ai (`docker/thedevs-ai/Dockerfile`)
 
 Слой на базе `thedevs-core` для сервисов с агентами CoreAI (`shield-3`):
 - `ARG BASE_IMAGE=registry.container-registry.svc.cluster.local:5000/thedevs-ru/thedevs-core:latest`
 - `FROM ${BASE_IMAGE}`
+- `ARG CACHEBUST=0`
 - Node.js 22 LTS: установка официального репозитория NodeSource через signed-by связку ключей `/etc/apt/keyrings/nodesource.gpg` (без использования небезопасного `curl | bash`).
 - GitHub CLI: установка `gh` через официальный репозиторий с `/etc/apt/keyrings/githubcli-archive-keyring.gpg`.
 - Claude Code CLI: `npm install -g @anthropic-ai/claude-code@${CLAUDE_CLI_VERSION}` с аргументом `ARG CLAUDE_CLI_VERSION=latest`, передаваемым из CI.
@@ -83,27 +99,32 @@ impl_effort: high
   `ARG AGY_CLI_URL=https://storage.googleapis.com/antigravity-public/antigravity-cli/1.2.3-5101874907578368/linux-x64/cli_linux_x64.tar.gz`
   `ARG AGY_CLI_SHA512=ec74dc5ce20e64623a4d68e73a8957e468c026bdb3d07b15c5291490323133970c735d985af839eab057b52b1bfd1b2e91ff49abeebef032ffae6dded8e2a763`
   `ENV AGY_CLI_DISABLE_AUTO_UPDATE=true`
-- Gemini CLI: исключен (закрыт Google 18.06.2026).
+- Gemini CLI: явно исключен (закрыт Google 18.06.2026, миграция в `TD-2212`).
 - Каталоги сессий CoreAI с правами `1000:1000`:
   `/app/.jmix/claude-home`, `/tmp/coreai-sessions`, `/tmp/coreai-tool-markers`.
+- Smoke-проверка на этапе сборки:
+  `node --version && npm --version && gh --version && claude --version && codex --version && agy --version`
 - ENTRYPOINT сохраняет `/usr/bin/tini --` для корректного сбора зомби-процессов Claude CLI.
 
-## 4. Слой thedevs-browser (`docker/thedevs-browser/Dockerfile`)
+## 5. Слой thedevs-browser (`docker/thedevs-browser/Dockerfile`)
 
 Слой на базе `thedevs-ai` для UI-рендеринга и скрапинга (`thedevslk`, `marta`, `flparser`):
 - `ARG BASE_IMAGE=registry.container-registry.svc.cluster.local:5000/thedevs-ru/thedevs-ai:latest`
 - `FROM ${BASE_IMAGE}`
-- Playwright: версия выровнена по `com.microsoft.playwright:playwright:1.58.0` (`ARG PLAYWRIGHT_VERSION=1.58.0`).
+- `ARG CACHEBUST=0`
+- `ARG PLAYWRIGHT_VERSION=1.58.0`
+- `LABEL ru.thedevs.playwright.version="${PLAYWRIGHT_VERSION}"`
 - Установка браузеров Chromium и Firefox с системными библиотеками:
   `ENV PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright`
   `ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1`
   `RUN npx --yes playwright@${PLAYWRIGHT_VERSION} install --with-deps chromium firefox`
-- Права доступа: Firefox в процессе работы создает lock-файл в каталоге установки. Выполняется обязательная настройка прав:
-  `RUN chown -R 1000:1000 ${PLAYWRIGHT_BROWSERS_PATH} && chmod -R 775 ${PLAYWRIGHT_BROWSERS_PATH}`.
+  `RUN npm install -g playwright@${PLAYWRIGHT_VERSION}`
+  `ENV NODE_PATH="/usr/local/lib/node_modules"`
+- Права доступа: каталог `/opt/ms-playwright` сохраняет владение `root:root` и права `755` (`find /opt/ms-playwright -type d -exec chmod 755 {} + && find /opt/ms-playwright -type f -exec chmod a+rx {} +`). Блокировочный файл `__dirlock` используется только при установке; пользовательские данные браузеров изолируются в эфемерных каталогах `/tmp`.
 - Smoke-проверка на этапе сборки образа:
-  `node -e "const { chromium, firefox } = require('playwright'); (async () => { const b1 = await chromium.launch(); await b1.close(); const b2 = await firefox.launch(); await b2.close(); console.log('Chromium & Firefox launch OK'); })()"`
+  `RUN node -e "const { chromium, firefox } = require('playwright'); (async () => { const b1 = await chromium.launch({ headless: true }); await b1.close(); const b2 = await firefox.launch({ headless: true }); await b2.close(); console.log('Chromium & Firefox launch OK'); })()"`
 
-## 5. Инфраструктурный манифест PVC (`k8s/pvc-cache.yaml`)
+## 6. Инфраструктурный манифест PVC (`k8s/pvc-cache.yaml`)
 
 Манифест создания тома кэша Kaniko для базовых образов:
 ```yaml
@@ -118,68 +139,87 @@ spec:
   storageClassName: standard
   resources:
     requests:
-      storage: 20Gi
+      storage: 10Gi
 ```
 
-## 6. Пайплайн сборки (`.github/workflows/build-base-images.yml`)
+## 7. CI-пайплайн сборки (`.github/workflows/build-base-images.yml`)
 
 1. **Триггеры и concurrency**:
-   - `workflow_dispatch` с выбором слоя: `layer` (`all`, `core`, `ai`, `browser`).
-   - `schedule`: cron `0 3 * * 0` (еженедельно в воскресенье в 03:00 UTC).
-   - `push`: ветки `dev` и `master` (пути `docker/**`, `k8s/**`, `.github/workflows/build-base-images.yml`).
+   - `workflow_dispatch` с выбором слоя: `layer: ['all', 'core', 'ai', 'browser']`.
+   - `schedule`: cron `0 3 * * 0` (еженедельно в воскресенье в 03:00 UTC на дефолтной ветке `dev`).
+   - `push`: ветка `dev` (пути `docker/**`, `k8s/**`, `.github/workflows/**`).
    - `concurrency: { group: base-images-${{ github.ref }}, cancel-in-progress: false }`.
-2. **Секреты и раннер**:
+2. **Права и раннер**:
+   - `permissions: { contents: read, id-token: write }`.
    - `runs-on: master` (self-hosted раннер с доступом к K8s кластеру).
-   - Необходимые org-секреты: `BUILDER_CONFIG_K8S`, `DOCKERHUB_USERNAME`, `DOCKERHUB_TOKEN`, `GH_PAT_SHIELD`.
-   - В K8s используется существующий секрет реестра `thedevs-registry-secret` (namespace `dev`).
-3. **Resolve job (`resolve`)**:
-   - Выполняется на `runs-on: master`.
+3. **Настройка K8s**:
+   - Шаг `azure/setup-kubectl@v4`.
+   - Шаг создания `~/.kube/config` из `secrets.BUILDER_CONFIG_K8S`.
+4. **Resolve job (`resolve`)**:
    - Вычисляет теги один раз в UTC:
      `DATE_TAG=$(date -u +'%Y%m%d')`
      `RUN_TAG="${{ github.ref_name }}-${DATE_TAG}-${{ github.run_number }}"`
    - Разрешает актуальную версию `@anthropic-ai/claude-code` через `npm view @anthropic-ai/claude-code version`.
-   - Формирует список `extra_tags`:
-     - На ветке `dev`: `dev`, `<branch>-YYYYMMDD-<run>`.
-     - На ветке `master`: `latest`, `master`, `master-YYYYMMDD-<run>`.
-   - Определяет флаги запуска слоев при `workflow_dispatch` с каскадным включением:
-     - `core`: запускает `core` -> `ai` -> `browser`.
-     - `ai`: запускает `ai` -> `browser`.
-     - `browser`: запускает `browser`.
-4. **Шаг инициализации инфраструктуры**:
+   - Формирует список `extra_tags`: для ветки `dev` передает `dev`.
+   - Определяет флаги сборки слоев (`build_core`, `build_ai`, `build_browser`):
+     - При cron или push: все слои `true`.
+     - При dispatch: каскад (`core` -> все `true`; `ai` -> `ai` и `browser` `true`; `browser` -> только `browser` `true`).
+   - Вычисляет `BASE_IMAGE_AI` и `BASE_IMAGE_BROWSER`:
+     - Если нижний слой собирается в текущем прогоне: `registry.container-registry.svc.cluster.local:5000/thedevs-ru/thedevs-<layer>:${RUN_TAG}`.
+     - Если нижний слой пропущен: `registry.container-registry.svc.cluster.local:5000/thedevs-ru/thedevs-<layer>:dev`.
+5. **Шаг инициализации инфраструктуры (`init-infra`)**:
    - Джоба `init-infra` применяет `kubectl apply -f k8s/pvc-cache.yaml --request-timeout=30s` для гарантии наличия тома `kaniko-cache-thedevs-base`.
-5. **Сборочные джобы (`build-core`, `build-ai`, `build-browser`)**:
-   - Последовательное выполнение: `build-core` -> `build-ai` -> `build-browser`.
-   - `build-ai` строится строго `FROM .../thedevs-core:<RUN_TAG>` текущего прогона через `build_args: BASE_IMAGE=.../thedevs-core:<RUN_TAG>`.
-   - `build-browser` строится строго `FROM .../thedevs-ai:<RUN_TAG>` текущего прогона через `build_args: BASE_IMAGE=.../thedevs-ai:<RUN_TAG>`.
-   - Использование `actions/kaniko-build` со всеми обязательными входами:
-     `namespace: dev`, `git_token: ${{ secrets.GH_PAT_SHIELD }}`, `dockerhub_username`, `dockerhub_token`, `cache_pvc: kaniko-cache-thedevs-base`, `cpu_limit: 16000m`, `build_timeout: 7200`.
-6. **Откат и продвижение**:
-   - Тег `latest` публикуется исключительно при сборках ветки `master`. Сборки `dev` не перезаписывают `latest`.
-   - Откат выполняется либо перетегированием проверенного тега `<branch>-YYYYMMDD-<run>` в `latest`, либо явной передачей `BASE_TAG` в деплойментах микросервисов.
+6. **Сборочные джобы (`build-core`, `build-ai`, `build-browser`)**:
+   - `build-core`: `needs: [resolve, init-infra]`, `if: ${{ !failure() && !cancelled() && needs.resolve.outputs.build_core == 'true' }}`.
+   - `build-ai`: `needs: [resolve, init-infra, build-core]`, `if: ${{ !failure() && !cancelled() && needs.resolve.outputs.build_ai == 'true' }}`.
+   - `build-browser`: `needs: [resolve, init-infra, build-ai]`, `if: ${{ !failure() && !cancelled() && needs.resolve.outputs.build_browser == 'true' }}`.
+   - Вызов `actions/kaniko-build` со всеми обязательными входами:
+     `image: thedevs-ru/thedevs-<layer>`, `tag: ${{ needs.resolve.outputs.run_tag }}`, `dockerfile: docker/thedevs-<layer>/Dockerfile`, `namespace: dev`, `git_token: ${{ secrets.GITHUB_TOKEN }}`, `dockerhub_username: ${{ secrets.DOCKERHUB_USERNAME }}`, `dockerhub_token: ${{ secrets.DOCKERHUB_TOKEN }}`, `cache_pvc: kaniko-cache-thedevs-base`, `cpu_limit: 16000m`, `build_timeout: 7200`, `extra_tags: ${{ needs.resolve.outputs.extra_tags }}`, `build_args: ...`.
 
-## 7. Контракты перевода проектов (дочерние задачи)
+## 8. Пайплайн продвижения и отката (`.github/workflows/promote-base-images.yml`)
 
-1. **`THEDEVS-RU/shield-3` -> `thedevs-ai`** (Задача `TD-2203`):
-   - Замена `FROM eclipse-temurin:25-jre-noble` на `FROM registry.container-registry.svc.cluster.local:5000/thedevs-ru/thedevs-ai:${BASE_TAG:-latest}`.
+1. Ручной запуск `workflow_dispatch` с входными параметрами:
+   - `source_tag`: неизменяемый проверенный тег (например `dev-20261018-12`).
+   - `promote_target`: выбор целевых тегов (`latest-and-master` или `rollback`).
+2. Продвижение выполняется без повторной компиляции и сборки через утилиту `skopeo copy`:
+   ```bash
+   REGISTRY="registry.container-registry.svc.cluster.local:5000/thedevs-ru"
+   for img in thedevs-core thedevs-ai thedevs-browser; do
+     skopeo copy --authfile /tmp/docker-config.json \
+       docker://${REGISTRY}/${img}:${SOURCE_TAG} \
+       docker://${REGISTRY}/${img}:latest
+     skopeo copy --authfile /tmp/docker-config.json \
+       docker://${REGISTRY}/${img}:${SOURCE_TAG} \
+       docker://${REGISTRY}/${img}:master
+   done
+   ```
+3. Откат (Rollback): выполняется аналогичным запуском с указанием предыдущего проверенного тега `<branch>-YYYYMMDD-<run>`, восстанавливая `latest` и `master` за секунды без пересборки.
+
+## 9. Контракты перевода проектов (дочерние задачи)
+
+1. **`THEDEVS-RU/shield-3` -> `thedevs-ai`** (Задача `TD-2204`, depends_on `TD-2201`):
+   - Замена `FROM eclipse-temurin:25-jre-noble` на `ARG BASE_TAG=latest` и `FROM registry.container-registry.svc.cluster.local:5000/thedevs-ru/thedevs-ai:${BASE_TAG}`.
    - Удаление дублирующихся установок Node.js, `gh`, `claude-code`, `agy`, `postgresql-client`.
    - Сохранение контрактов: `find . -name "*-plain.jar" -delete && mv *.jar app.jar && chown 1000:1000 app.jar`.
-   - Флаг `-XX:MaxRAMPercentage=85` переносится в `JAVA_TOOL_OPTIONS` манифеста деплоймента.
+   - Сервисные флаги JVM (`-XX:MaxRAMPercentage=85`, `-XX:+ExplicitGCInvokesConcurrent`, `-Xlog:gc*...`) сохраняются в переменной `JAVA_TOOL_OPTIONS` манифеста `deployment-shield-dev.yaml`.
    - `ENTRYPOINT ["/usr/bin/tini", "--", "java", "-jar", "app.jar"]`.
-2. **`THEDEVS-RU/thedevslk` -> `thedevs-browser`** (Задача `TD-2204`):
-   - Замена ручной сборки рантайма на `FROM registry.container-registry.svc.cluster.local:5000/thedevs-ru/thedevs-browser:${BASE_TAG:-latest}`.
+2. **`THEDEVS-RU/thedevslk` -> `thedevs-browser`** (Задача `TD-2205`, depends_on `TD-2201`):
+   - Замена ручной сборки рантайма на `ARG BASE_TAG=latest` и `FROM registry.container-registry.svc.cluster.local:5000/thedevs-ru/thedevs-browser:${BASE_TAG}`.
    - Сохранение `scripts/generate-kubeconfig.sh`, `scripts/entrypoint.sh` и `kubectl`.
    - Сохранение `ENTRYPOINT ["/usr/bin/tini", "--", "/entrypoint.sh"]`.
    - Использование запеченных шрифтов `fonts-liberation` и `fonts-dejavu-core` для отчетов `BAL_INVOICE`.
-3. **`THEDEVS-RU/mobitrack-2` -> `thedevs-core`** (Задача `TD-2205`):
-   - Замена на `FROM registry.container-registry.svc.cluster.local:5000/thedevs-ru/thedevs-core:${BASE_TAG:-latest}`.
+   - Передача параметров безопасности при запуске браузеров: `--force-webrtc-ip-handling-policy=disable_non_proxied_udp` для Chromium, `media.peerconnection.enabled=false` для Firefox.
+3. **`THEDEVS-RU/mobitrack-2` -> `thedevs-core`** (Задача `TD-2206`, depends_on `TD-2201`):
+   - Замена на `ARG BASE_TAG=latest` и `FROM registry.container-registry.svc.cluster.local:5000/thedevs-ru/thedevs-core:${BASE_TAG}`.
    - Сохранение импорта банковских сертификатов Минцифры в cacerts (`COPY docker/certs/*.pem /tmp/certs/` и `keytool -importcert`).
    - Сохранение `find . -name "*-plain.jar" -delete && mv *.jar app.jar`.
-4. **`THEDEVS-RU/TemplateProject` -> `thedevs-core`** (Задача `TD-2206`):
-   - Замена на `FROM registry.container-registry.svc.cluster.local:5000/thedevs-ru/thedevs-core:${BASE_TAG:-latest}`.
+4. **`THEDEVS-RU/TemplateProject` -> `thedevs-core`** (Задача `TD-2207`, depends_on `TD-2201`):
+   - Замена на `ARG BASE_TAG=latest` и `FROM registry.container-registry.svc.cluster.local:5000/thedevs-ru/thedevs-core:${BASE_TAG}`.
    - Чистый эталон для микросервисов платформы без CoreAI.
-5. **`THEDEVS-RU/marta` & `THEDEVS-RU/flparser` -> `thedevs-browser`** (Задача `TD-2207`):
-   - Замена `marta-base` на `FROM registry.container-registry.svc.cluster.local:5000/thedevs-ru/thedevs-browser:${BASE_TAG:-latest}`.
+5. **`THEDEVS-RU/marta` (деплойменты `marta` и `flparser`) -> `thedevs-browser`** (Задача `TD-2208`, depends_on `TD-2201`):
+   - Замена `marta-base` на `ARG BASE_TAG=latest` и `FROM registry.container-registry.svc.cluster.local:5000/thedevs-ru/thedevs-browser:${BASE_TAG}`.
    - Удаление устаревших артефактов в `marta`: `Dockerfile.base`, `.github/workflows/build-base.yml`, образ `marta-base`.
+   - Удаление переопределения `PLAYWRIGHT_BROWSERS_PATH` в манифесте `deployment-flparser-dev.yaml`.
    - Сохранение каталогов `/app/.jmix/heapdumps` и `/app/.jmix/gc-logs`, `USER 1000`.
 
 ## Затрагиваемые файлы
@@ -189,7 +229,8 @@ spec:
 3. `docker/thedevs-browser/Dockerfile`
 4. `k8s/pvc-cache.yaml`
 5. `.github/workflows/build-base-images.yml`
-6. `README.md`
+6. `.github/workflows/promote-base-images.yml`
+7. `README.md`
 
 # Что уже есть
 
@@ -198,31 +239,32 @@ spec:
 3. Сборочный узел `.248` с 24 потоками AMD Ryzen 9 7900X под управлением Kubernetes.
 4. Внутренний реестр кластера `registry.container-registry.svc.cluster.local:5000/thedevs-ru/` и внешний шлюз `registry.thedevs.ru`.
 5. Кластерная база данных `PostgreSQL 16.10` на `postgres-service.default.svc.cluster.local:5432`.
-6. Библиотека `ru.thedevs:browser-starter` в `addon-browser@dev:gradle/libs.versions.toml:4` на базе `com.microsoft.playwright:playwright:1.58.0`.
+6. Зависимость `com.microsoft.playwright:playwright:1.58.0` в `addon-browser@dev:gradle/libs.versions.toml:4`.
+7. Заведенные задачи на доске: `TD-2204` (shield-3), `TD-2205` (thedevslk), `TD-2206` (mobitrack-2), `TD-2207` (TemplateProject), `TD-2208` (marta/flparser), `TD-2209` (SSRF-фильтр), `TD-2210` (Egress NetworkPolicy UDP), `TD-2211` (Playwright unforce), `TD-2212` (Gemini CLI аудит/миграция).
 
 # Модель угроз
 
 Включение инструментов выполнения кода, CLI-утилит и headless-браузеров (Chromium, Firefox) в слои `thedevs-ai` и `thedevs-browser` требует строгого анализа рисков работы с внешним контентом per `security-external-content.md`:
 
 ### 1. SSRF (Server-Side Request Forgery)
-- **Реализовано в базе**: В базовые образы не запекаются пароли, статические API-ключи или токены доступа к сервисам кластера.
+- **Реализовано в базе**: В базовые образы не запекаются пароли, статические API-ключи, служебные токены кластера или kubeconfig.
 - **Требования к сервисам-потребителям**: Потребители (`flparser`, `marta`, `thedevslk`) обязаны валидировать IP-адрес назначения строго в момент установки TCP Connect (кастомный `DnsResolver` / socket connect hook) с блокировкой приватных сетей RFC 1918 (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`), Loopback (`127.0.0.0/8`), Link-Local (`169.254.0.0/16`), Cloud Metadata (`169.254.169.254`, `metadata.google.internal`) и имен K8s (`*.svc.cluster.local`, `kubernetes.default`). Разрешены строго схемы `http://` и `https://`; схемы `file://`, `chrome://`, `data:` запрещены.
-- **Пробел / Follow-up**: Централизованный SSRF-фильтр в `addon-browser` оформляется задачей `TD-2208`.
+- **Пробел / Follow-up**: Централизованный SSRF-фильтр в `addon-browser` оформлен задачей `TD-2209`.
 
 ### 2. Обход loopback в Chromium (`<-loopback>`)
 - **Реализовано в базе**: Базовый образ не навязывает небезопасных дефолтных флагов Chromium.
 - **Требования к сервисам-потребителям**: Сервисы автоматизации браузера обязаны передавать флаг `--proxy-bypass-list=<-loopback>` при старте Chromium для предотвращения скрытого обхода прокси-фильтра при обращении к `localhost`. Внутренние эндпоинты (`/mcp`, Spring Actuator) защищаются обязательной Bearer-аутентификацией.
-- **Пробел / Follow-up**: Контролируется тестами в задаче перевода `TD-2204`.
+- **Пробел / Follow-up**: Контролируется тестами в задаче перевода `TD-2205`.
 
 ### 3. Утечки через WebRTC и UDP
-- **Реализовано в базе**: В базовый образ запекается скрипт-обертка запуска браузера с параметром `--force-webrtc-ip-handling-policy=disable_non_proxied_udp`.
-- **Требования к сервисам-потребителям**: Запуск Chromium с подавлением непроксированного UDP-трафика.
-- **Пробел / Follow-up**: В namespace `dev` политики `NetworkPolicy` в настоящий момент отсутствуют (`kubectl get networkpolicy -n dev` -> `No resources found`). Блокировка исходящего UDP на уровне кластера выделена в отдельную инфраструктурную задачу `TD-2202`.
+- **Реализовано в базе**: Ничего (базовый образ содержит бинарные пакеты браузеров).
+- **Требования к сервисам-потребителям**: Запуск Chromium с аргументом `--force-webrtc-ip-handling-policy=disable_non_proxied_udp`, настройка Firefox через `media.peerconnection.enabled=false` в параметрах контекста. Задачи `TD-2205` и `TD-2208`.
+- **Пробел / Follow-up**: В namespace `dev` политики `NetworkPolicy` отсутствуют (`kubectl get networkpolicy -n dev` -> `No resources found`). Блокировка исходящего UDP на уровне кластера выделена в отдельную инфраструктурную задачу `TD-2210`.
 
 ### 4. Попапы, загрузки файлов и сервис-воркеры
 - **Реализовано в базе**: Переменная `PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1` запрещает скачивание сторонних версий браузеров в рантайме.
 - **Требования к сервисам-потребителям**: Потребители настраивают контексты Playwright с параметрами `serviceWorkers: 'block'`, `--disable-features=ServiceWorker`, `acceptDownloads: false` и обработчиком `page.on('popup', p => p.close())`.
-- **Пробел / Follow-up**: Полноценный `readOnlyRootFilesystem: true` не может быть включен в контейнере без монтирования `emptyDir` томов, так как сессионные каталоги `/tmp/coreai-sessions`, `/tmp/coreai-tool-markers`, `/app/.jmix/` и lock-файлы Firefox в `/opt/ms-playwright` требуют записи.
+- **Пробел / Follow-up**: Полноценный `readOnlyRootFilesystem: true` не может быть включен в контейнере без монтирования `emptyDir` томов, так как сессионные каталоги `/tmp/coreai-sessions`, `/tmp/coreai-tool-markers` и `/app/.jmix/` требуют записи.
 
 ### 5. Keep-Alive и переиспользование сетевых соединений
 - **Реализовано в базе**: Отсутствуют разделяемые пулы соединений на уровне ОС.
@@ -230,8 +272,8 @@ spec:
 - **Пробел / Follow-up**: Реализовано в `addon-limiter`.
 
 ### 6. Изоляция Origin
-- **Реализовано в базе**: Исключено выполнение пользовательского JavaScript на домене приложения.
-- **Требования к сервисам-потребителям**: Запрещен рендеринг внешнего HTML через `<iframe>` с `SAMEORIGIN`. Отображение внешних веб-страниц в UI Личного Кабинета выполняется исключительно через графические снимки (PNG/WebP canvas stream) либо на изолированном домене `*.thedevs-preview.ru` с атрибутом `sandbox="allow-scripts"` (без `allow-same-origin`).
+- **Реализовано в базе**: Ничего (базовый образ не навязывает веб-сервер и домен).
+- **Требования к сервисам-потребителям**: Запрещен рендеринг внешнего HTML через `<iframe>` с `SAMEORIGIN`. Отображение внешних веб-страниц в UI Личного Кабинета выполняется исключительно через графические снимки (PNG/WebP canvas stream) либо на изолированном домене `*.thedevs-preview.ru` с атрибутом `sandbox="allow-scripts"` (без `allow-same-origin`). Задача `TD-2205`.
 - **Пробел / Follow-up**: Соответствует стандарту `thedevslk:LkUiPreviewRenderService`.
 
 ### 7. Разграничение сервисных ролей и сессий пользователей
@@ -245,28 +287,28 @@ spec:
   - `flparser`: `limits.memory: 6Gi` (куча JVM `-XX:MaxRAMPercentage=50` = 3.0 GiB, 3.0 GiB для ОС, Node.js и Firefox на 1–2 сессии).
   - `thedevslk`: `limits.memory: 10Gi` (куча JVM ~4–6 GiB, остаток для Playwright Chromium и сессий Claude CLI).
   - `shield`: `limits.memory: 20Gi` (куча JVM `-XX:MaxRAMPercentage=85` = 17.0 GiB, 3.0 GiB для CoreAI CLI).
-- **Пробел / Follow-up**: Потребители браузера обязаны лимитировать одновременные браузерные вкладки (не более 1–2 на под).
+- **Пробел / Follow-up**: Потребители браузера обязаны лимитировать одновременные браузерные вкладки (не более 1–2 на под). Задачи `TD-2205`, `TD-2208`.
 
 # Критерии готовности
 
-1. Создан приватный репозиторий `THEDEVS-RU/base-images` с ветками `dev` и `master`, подключенный к self-hosted раннеру `master` и настроенными секретами (`BUILDER_CONFIG_K8S`, `DOCKERHUB_USERNAME`, `DOCKERHUB_TOKEN`, `GH_PAT_SHIELD`).
-2. В репозитории `THEDEVS-RU/base-images` созданы и синтаксически валидны 3 Dockerfile: `docker/thedevs-core/Dockerfile`, `docker/thedevs-ai/Dockerfile`, `docker/thedevs-browser/Dockerfile`.
-3. Создан и применен манифест `k8s/pvc-cache.yaml`, в результате чего в namespace `dev` успешно создан и примонтирован PVC `kaniko-cache-thedevs-base`.
-4. Создан CI-пайплайн `.github/workflows/build-base-images.yml` с поддержкой `concurrency`, расчетом `DATE_TAG` в resolve-джобе, поддержкой ручного запуска с каскадной пересборкой зависимых слоев и сборкой на self-hosted раннере `master`.
-5. Пайплайн успешно собирает и публикует 3 слоя в `registry.thedevs.ru/thedevs-ru/thedevs-{core,ai,browser}` с тегами:
-   - Ветка `dev`: `dev`, `dev-YYYYMMDD-<run>`.
-   - Ветка `master`: `latest`, `master`, `master-YYYYMMDD-<run>`.
+1. Оператором выполнены предварительные условия bootstrap: репозиторий `THEDEVS-RU/base-images` создан, дефолтная ветка `dev`, назначен раннер `master`, выданы секреты `BUILDER_CONFIG_K8S`, `DOCKERHUB_USERNAME`, `DOCKERHUB_TOKEN`.
+2. В репозитории `THEDEVS-RU/base-images` созданы 3 Dockerfile: `docker/thedevs-core/Dockerfile`, `docker/thedevs-ai/Dockerfile`, `docker/thedevs-browser/Dockerfile`.
+3. Создан и применен манифест `k8s/pvc-cache.yaml`, в результате чего в namespace `dev` успешно создан PVC `kaniko-cache-thedevs-base` объемом 10Gi.
+4. Создан CI-пайплайн `.github/workflows/build-base-images.yml` с правами `contents: read, id-token: write`, настройкой K8s из `secrets.BUILDER_CONFIG_K8S`, расчетом `DATE_TAG` в UTC, поддержкой cron на ветке `dev`, ручным запуском с каскадной пересборкой зависимых слоев и сборкой на self-hosted раннере `master`.
+5. Пайплайн успешно собирает и публикует 3 слоя в `registry.thedevs.ru/thedevs-ru/thedevs-{core,ai,browser}` с тегами `dev` и `dev-YYYYMMDD-<run>`.
 6. Выполнены автоматизированные smoke-проверки в сборочном пайплайне:
-   - `thedevs-core`: `java -version`, `pg_dump --version` (клиент 17.x, сервер >= 16.10), `git --version`, `jq --version`, `curl --version`, `/usr/bin/tini --version`.
-   - `thedevs-ai`: `node --version`, `npm --version`, `claude --version`, `gh --version`, `agy --version`, `codex --version`.
-   - `thedevs-browser`: успешный запуск и завершение headless Chromium и Firefox через Playwright 1.58.0.
-7. Проведен сравнительный замер длительности сборки микросервисов (`thedevslk`, `shield-3`, `mobitrack-2`) до и после перевода на базовые образы с фиксацией результатов в карточке задачи.
-8. Спецификация проходит валидатор формата `validate-spec-format.sh specs/2026-10-17-thedevs-base-images-lego-stack.md` с кодом 0 и закоммичена в ветку `task/TD-2201` в репозитории `THEDEVS-RU/.github`.
+   - `thedevs-core`: `java -version`, `pg_dump --version` (клиент v18, совместим с сервером 16.10), `git --version`, `jq --version`, `curl --version`, `/usr/bin/tini --version`.
+   - `thedevs-ai`: `node --version` (v22), `npm --version`, `claude --version`, `gh --version`, `agy --version`, `codex --version`. Gemini CLI отсутствует.
+   - `thedevs-browser`: успешный запуск и закрытие headless Chromium и Firefox через `node -e "const { chromium, firefox } = require('playwright'); ..."` с Playwright 1.58.0.
+7. Создан пайплайн продвижения `.github/workflows/promote-base-images.yml`, перетегирующий проверенный digest в `master` и `latest` через `skopeo copy`, а также поддерживающий откат к предыдущему тегу.
+8. Созданы и привязаны к `TD-2201` все дочерние задачи перевода проектов (`TD-2204`–`TD-2208`) и сопутствующие задачи безопасности/зависимостей (`TD-2209`–`TD-2212`).
+9. Спецификация проходит валидатор формата `validate-spec-format.sh specs/2026-10-17-thedevs-base-images-lego-stack.md` с кодом 0 и закоммичена в ветку `task/TD-2201` в репозитории `THEDEVS-RU/.github`.
 
 # Не трогать
 
-1. Не публиковать тег `latest` из сборок ветки `dev` (тег `latest` формируется строго из ветки `master`).
-2. Не включать дефолтные флаги памяти JVM в `JAVA_TOOL_OPTIONS` базовых образов (настройки памяти остаются исключительной зоной ответственности env-переменных деплойментов).
-3. Не коммитить и не пушить изменения напрямую в ветки `dev`, `main`, `master`.
-4. Не изменять лимит памяти Kaniko `limits.memory: 8Gi` в сборочных подах (инвариант защиты ноды `.248`).
-5. Не производить непосредственную модификацию исходного кода микросервисов (`shield-3`, `thedevslk`, `mobitrack-2`, `TemplateProject`, `marta`, `flparser`) в рамках спецификации `TD-2201` — перевод сервисов выполняется строго отдельными дочерними задачами реализации `TD-2203`–`TD-2207`.
+1. Не пересобирать образы в ветке `master` с нуля — продвижение в `master` и `latest` выполняется строго перетегированием проверенного digest ветки `dev` через `skopeo copy`.
+2. Не публиковать тег `latest` из сборок ветки `dev` (тег `latest` выставляется исключительно через пайплайн продвижения).
+3. Не включать дефолтные флаги памяти JVM в `JAVA_TOOL_OPTIONS` базовых образов (настройки памяти остаются исключительной зоной ответственности env-переменных деплойментов).
+4. Не коммитить и не пушить изменения напрямую в ветки `dev`, `main`, `master`.
+5. Не изменять лимит памяти Kaniko `limits.memory: 8Gi` в сборочных подах (инвариант защиты ноды `.248`).
+6. Не производить непосредственную модификацию исходного кода микросервисов (`shield-3`, `thedevslk`, `mobitrack-2`, `TemplateProject`, `marta`, `flparser`) в рамках задачи `TD-2201` — перевод выполняется строго отдельными дочерними задачами реализации `TD-2204`–`TD-2208`.
