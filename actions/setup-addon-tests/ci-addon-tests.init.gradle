@@ -376,9 +376,13 @@ gradle.projectsEvaluated {
                 def unresolved = lenient.unresolvedModuleDependencies
 
                 def rootUnresolved = unresolved.find {
-                    def selGroup = it.selector.hasProperty('group') ? it.selector.group : null
-                    def selModule = it.selector.hasProperty('module') ? it.selector.module : (it.selector.hasProperty('name') ? it.selector.name : null)
-                    return selGroup == depGroup && selModule == "${baseModule}-tests"
+                    def str = it.selector?.toString() ?: ''
+                    if (str.startsWith("${depGroup}:${baseModule}-tests")) {
+                        return true
+                    }
+                    def g = it.selector.hasProperty('group') ? it.selector.group : null
+                    def n = it.selector.hasProperty('name') ? it.selector.name : (it.selector.hasProperty('module') ? it.selector.module : null)
+                    return g == depGroup && (n == "${baseModule}-tests" || n == "${baseModule}")
                 }
 
                 if (rootUnresolved != null) {
