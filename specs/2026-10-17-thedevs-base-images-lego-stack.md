@@ -15,12 +15,12 @@ impl_effort: high
 - **Consumes**:
   1. `actions/kaniko-build` из `THEDEVS-RU/.github@dev` с поддержкой входных параметров `cpu_limit`, `extra_tags` и `build_args` per `2026-10-17-kaniko-build-cpu-limit-and-build-args` (PR THEDEVS-RU/.github#29, задача TD-2197).
   2. K8s Secret `thedevs-registry-secret` (тип `kubernetes.io/dockerconfigjson`) в namespace `dev` для авторизации в реестре `registry.thedevs.ru`.
-  3. Прецедент тиражирования и копирования образов через кластерный под `crane` с флагом `--insecure` из `marta/.github/workflows/mirror-images.yml:35-67`.
+  3. Прецедент тиражирования и копирования образов через кластерные поды `crane` с флагом `--insecure` из `marta/.github/workflows/mirror-images.yml:35-67`.
   4. Предварительные условия bootstrap оператора: созданный приватный репозиторий `THEDEVS-RU/base-images`, дефолтная ветка `dev`, группа self-hosted раннеров `master`, доступ к org-секретам `BUILDER_CONFIG_K8S`, `DOCKERHUB_USERNAME`, `DOCKERHUB_TOKEN`.
 - **Produces**:
   1. Репозиторий `THEDEVS-RU/base-images` со структурой Dockerfile для 3 слоев Lego-стека (`thedevs-core` -> `thedevs-ai` -> `thedevs-browser`) и манифестом K8s PVC кэша `k8s/pvc-cache.yaml` (10Gi).
   2. CI-пайплайн `.github/workflows/build-base-images.yml` на self-hosted раннере `master` с регулярной сборкой (cron по воскресеньям в 03:00 UTC на дефолтной ветке `dev`), ручным запуском (`workflow_dispatch`), расчетом тегов в resolve-джобе, каскадной пересборкой зависимых слоев и сборкой тегов `dev`, `<branch>-YYYYMMDD-<run>`.
-  3. Пайплайн продвижения `.github/workflows/promote-base-images.yml` для перетегирования проверенного digest в `master` и `latest` через эфемерный под `gcr.io/go-containerregistry/crane` в кластере без повторной сборки.
+  3. Пайплайн продвижения `.github/workflows/promote-base-images.yml` для перетегирования проверенного digest в `master` и `latest` через эфемерные поды `gcr.io/go-containerregistry/crane:latest` в кластере без повторной сборки.
   4. Опубликованные базовые Docker-образы в `registry.container-registry.svc.cluster.local:5000/thedevs-ru/thedevs-{core,ai,browser}` (внешний шлюз `registry.thedevs.ru`).
   5. Контракт перевода проектов платформы (`shield-3`, `thedevslk`, `mobitrack-2`, `TemplateProject`, `marta`/`flparser`) на базовые слои через дочерние задачи (`TD-2204`–`TD-2208`).
 
@@ -47,7 +47,7 @@ impl_effort: high
 7. **Структура marta и flparser**:
    - Оба сервиса размещены в едином репозитории `THEDEVS-RU/marta` (деплойменты генерируются из `Deployment/app.yaml.tpl:43,102`). Перевод обоих сервисов с упразднением `marta-base` и снятием переопределения `PLAYWRIGHT_BROWSERS_PATH` оформлен в задачу `TD-2208`.
 8. **Каскадное продвижение и cron**:
-   - GitHub cron запускается строго на дефолтной ветке `dev`. Ветка `master` не пересобирает образы, а продвигает проверенный digest из `dev` перетегированием через под с `crane copy --insecure`. Потребители на ветке `dev` передают `build_args: BASE_TAG=dev`.
+   - GitHub cron запускается строго на дефолтной ветке `dev`. Ветка `master` не пересобирает образы, а продвигает проверенный digest из `dev` перетегированием через кластерные поды с `crane copy --insecure`. Потребители на ветке `dev` передают `build_args: BASE_TAG=dev`.
 
 # Что сделать
 
@@ -84,14 +84,12 @@ impl_effort: high
 - `WORKDIR /app`, `chown -R 1000:1000 /app`.
 - Отсутствие дефолтных флагов кучи JVM в `JAVA_TOOL_OPTIONS`.
 - `ENTRYPOINT ["/usr/bin/tini", "--"]`.
-- `ARG CACHEBUST=0` для управляемой инвалидации кэша слоев при обновлениях безопасности.
 
 ## 4. Слой thedevs-ai (`docker/thedevs-ai/Dockerfile`)
 
 Слой на базе `thedevs-core` для сервисов с агентами CoreAI (`shield-3`):
 - `ARG BASE_IMAGE=registry.container-registry.svc.cluster.local:5000/thedevs-ru/thedevs-core:latest`
 - `FROM ${BASE_IMAGE}`
-- `ARG CACHEBUST=0`
 - Node.js 22 LTS: установка официального репозитория NodeSource через signed-by связку ключей `/etc/apt/keyrings/nodesource.gpg` (без использования небезопасного `curl | bash`).
 - GitHub CLI: установка `gh` через официальный репозиторий с `/etc/apt/keyrings/githubcli-archive-keyring.gpg`.
 - Claude Code CLI: `npm install -g @anthropic-ai/claude-code@${CLAUDE_CLI_VERSION}` с аргументом `ARG CLAUDE_CLI_VERSION=latest`, передаваемым из CI.
@@ -112,7 +110,6 @@ impl_effort: high
 Слой на базе `thedevs-ai` для UI-рендеринга и скрапинга (`thedevslk`, `marta`, `flparser`):
 - `ARG BASE_IMAGE=registry.container-registry.svc.cluster.local:5000/thedevs-ru/thedevs-ai:latest`
 - `FROM ${BASE_IMAGE}`
-- `ARG CACHEBUST=0`
 - `ARG PLAYWRIGHT_VERSION=1.58.0`
 - `LABEL ru.thedevs.playwright.version="${PLAYWRIGHT_VERSION}"`
 - Установка браузеров Chromium и Firefox с системными библиотеками:
@@ -184,7 +181,6 @@ spec:
      `cpu_limit: 16000m`
      `build_timeout: 7200`
      `extra_tags: ${{ needs.resolve.outputs.extra_tags }}`
-     `build_args: CACHEBUST=${{ needs.resolve.outputs.date_tag }}`
    - `build-ai`: `needs: [resolve, init-infra, build-core]`, `if: ${{ !failure() && !cancelled() && needs.resolve.outputs.build_ai == 'true' }}`.
      Входные параметры `actions/kaniko-build`:
      `image: registry.container-registry.svc.cluster.local:5000/thedevs-ru/thedevs-ai`
@@ -198,7 +194,12 @@ spec:
      `cpu_limit: 16000m`
      `build_timeout: 7200`
      `extra_tags: ${{ needs.resolve.outputs.extra_tags }}`
-     `build_args: BASE_IMAGE=${{ needs.resolve.outputs.base_image_ai }},CLAUDE_CLI_VERSION=${{ needs.resolve.outputs.claude_version }},CACHEBUST=${{ needs.resolve.outputs.date_tag }}`
+     `build_args`: multiline список с одной парой KEY=VALUE на строку per PR #29:
+     ```yaml
+     build_args: |
+       BASE_IMAGE=${{ needs.resolve.outputs.base_image_ai }}
+       CLAUDE_CLI_VERSION=${{ needs.resolve.outputs.claude_version }}
+     ```
    - `build-browser`: `needs: [resolve, init-infra, build-ai]`, `if: ${{ !failure() && !cancelled() && needs.resolve.outputs.build_browser == 'true' }}`.
      Входные параметры `actions/kaniko-build`:
      `image: registry.container-registry.svc.cluster.local:5000/thedevs-ru/thedevs-browser`
@@ -212,26 +213,25 @@ spec:
      `cpu_limit: 16000m`
      `build_timeout: 7200`
      `extra_tags: ${{ needs.resolve.outputs.extra_tags }}`
-     `build_args: BASE_IMAGE=${{ needs.resolve.outputs.base_image_browser }},PLAYWRIGHT_VERSION=1.58.0,CACHEBUST=${{ needs.resolve.outputs.date_tag }}`
+     `build_args`: multiline список с одной парой KEY=VALUE на строку per PR #29:
+     ```yaml
+     build_args: |
+       BASE_IMAGE=${{ needs.resolve.outputs.base_image_browser }}
+       PLAYWRIGHT_VERSION=1.58.0
+     ```
 
 ## 8. Пайплайн продвижения и отката (`.github/workflows/promote-base-images.yml`)
 
 1. Ручной запуск `workflow_dispatch` с входными параметрами:
    - `source_tag`: неизменяемый проверенный тег (например `dev-20261018-12`).
    - `promote_target`: выбор целевых тегов (`latest-and-master` или `rollback`).
-2. Продвижение выполняется без повторной сборки через запуск эфемерного пода с утилитой `crane` внутри K8s кластера per `marta/.github/workflows/mirror-images.yml:35-67`:
+2. Продвижение выполняется без повторной сборки через запуск эфемерных подов с `gcr.io/go-containerregistry/crane:latest` внутри K8s кластера per `marta/.github/workflows/mirror-images.yml:35-67`:
    - Настройка `KUBECONFIG` из `secrets.BUILDER_CONFIG_K8S`.
-   - Запуск пода `crane-promote` в namespace `dev` с образом `gcr.io/go-containerregistry/crane:latest` и флагом `--insecure`.
-   - Проверка наличия `SOURCE_TAG` для каждого слоя (`crane digest ... --insecure`).
-   - Копирование проверенного digest в `latest` и `master`:
-     ```bash
-     REGISTRY="registry.container-registry.svc.cluster.local:5000/thedevs-ru"
-     for img in thedevs-core thedevs-ai thedevs-browser; do
-       crane copy "${REGISTRY}/${img}:${SOURCE_TAG}" "${REGISTRY}/${img}:latest" --insecure
-       crane copy "${REGISTRY}/${img}:${SOURCE_TAG}" "${REGISTRY}/${img}:master" --insecure
-     done
-     ```
-   - Ожидание завершения пода (`Phase == Succeeded`).
+   - Итерация по списку образов `IMAGES=("thedevs-core" "thedevs-ai" "thedevs-browser")`:
+     1. Проверка наличия тега `SOURCE_TAG` через запуск пода crane с `args: ["digest", "${REGISTRY}/${img}:${SOURCE_TAG}", "--insecure"]`.
+     2. Перетегирование в `latest` через запуск пода crane с `args: ["copy", "${REGISTRY}/${img}:${SOURCE_TAG}", "${REGISTRY}/${img}:latest", "--insecure"]`.
+     3. Перетегирование в `master` через запуск пода crane с `args: ["copy", "${REGISTRY}/${img}:${SOURCE_TAG}", "${REGISTRY}/${img}:master", "--insecure"]`.
+   - Для каждого пода ожидается завершение фазы (`Phase == Succeeded`).
 3. Откат (Rollback): выполняется аналогичным запуском с указанием предыдущего проверенного тега `<branch>-YYYYMMDD-<run>`, восстанавливая `latest` и `master` за секунды без пересборки.
 
 ## 9. Контракты перевода проектов (дочерние задачи)
@@ -344,7 +344,7 @@ spec:
    - `thedevs-core`: `java -version`, `pg_dump --version` (клиент v18, совместим с сервером 16.10), `git --version`, `jq --version`, `curl --version`, `/usr/bin/tini --version`.
    - `thedevs-ai`: `node --version` (v22), `npm --version`, `claude --version`, `gh --version`, `agy --version`, `codex --version`. Gemini CLI отсутствует.
    - `thedevs-browser`: успешная проверка `test -d "$(npm root -g)/playwright"`, запуск и закрытие headless Chromium и Firefox через `node -e "const { chromium, firefox } = require('playwright'); ..."` с Playwright 1.58.0.
-7. Создан пайплайн продвижения `.github/workflows/promote-base-images.yml`, перетегирующий проверенный digest в `master` и `latest` через под `crane copy --insecure`, а также поддерживающий откат к предыдущему тегу.
+7. Создан пайплайн продвижения `.github/workflows/promote-base-images.yml`, перетегирующий проверенный digest в `master` и `latest` через кластерные поды `crane copy --insecure`, а также поддерживающий откат к предыдущему тегу.
 8. Выполнен первичный запуск воркфлоу продвижения `promote-base-images.yml` для формирования базовых тегов `latest` и `master` в реестре до запуска задач перевода проектов.
 9. Созданы и привязаны к `TD-2201` все дочерние задачи перевода проектов (`TD-2204`–`TD-2208`) и сопутствующие задачи безопасности/зависимостей (`TD-2209`–`TD-2212`).
 10. Спецификация проходит валидатор формата `validate-spec-format.sh specs/2026-10-17-thedevs-base-images-lego-stack.md` с кодом 0 и закоммичена в ветку `task/TD-2201` в репозитории `THEDEVS-RU/.github`.
