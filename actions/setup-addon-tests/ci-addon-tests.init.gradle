@@ -240,9 +240,8 @@ gradle.allprojects { p ->
                                                 depNode.appendNode('scope', 'runtime')
 
                                                 // Preserve declared exclusions
-                                                def projDep = p.configurations.testImplementation.dependencies
-                                                    .withType(ProjectDependency)
-                                                    .find { it.dependencyProject == subproject }
+                                                def projDep = (p.configurations.findByName('testImplementation')?.dependencies?.withType(ProjectDependency) ?: [])
+                                                    .find { it.path == subproject.path }
                                                 if (projDep != null && !projDep.excludeRules.isEmpty()) {
                                                     def exclusionsNode = depNode.appendNode('exclusions')
                                                     projDep.excludeRules.each { rule ->
