@@ -78,6 +78,7 @@ base {
 dependencies {
     testImplementation 'org.junit.jupiter:junit-jupiter-api:5.10.2'
     testRuntimeOnly 'org.junit.jupiter:junit-jupiter-engine:5.10.2'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher:1.10.2'
     testImplementation(dependencies.create(project(':helper-test')) {
         exclude group: 'org.slf4j', module: 'slf4j-api'
     })
@@ -303,6 +304,7 @@ dependencies {
     implementation 'ru.thedevs:upstream-starter:1.0.0'
     testImplementation 'org.junit.jupiter:junit-jupiter-api:5.10.2'
     testRuntimeOnly 'org.junit.jupiter:junit-jupiter-engine:5.10.2'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher:1.10.2'
 }
 // Emulate Jmix plugin mutating configurations in afterEvaluate
 project.afterEvaluate {
