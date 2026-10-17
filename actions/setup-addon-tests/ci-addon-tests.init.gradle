@@ -394,6 +394,7 @@ gradle.projectsEvaluated {
                     } else {
                         println "::warning::[TD-2039] Skipped dependency tests for '${depGroup}:${baseModule}': tests artifact not yet published (pre-rollout)."
                         testState.skippedPreRollout = true
+                        testAddon.enabled = false
                         return
                     }
                 }
@@ -412,6 +413,7 @@ gradle.projectsEvaluated {
                     } else {
                         println "::warning::[TD-2039] Skipped dependency tests for '${depGroup}:${baseModule}': tests artifact not yet published (pre-rollout)."
                         testState.skippedPreRollout = true
+                        testAddon.enabled = false
                         return
                     }
                 }
@@ -430,6 +432,7 @@ gradle.projectsEvaluated {
                 if ('true'.equalsIgnoreCase(depProps.getProperty('thedevs.tests.disabled'))) {
                     println "[TD-2039] Dependency '${depGroup}:${baseModule}' marked with thedevs.tests.disabled=true. No tests to run."
                     testState.testsDisabled = true
+                    testAddon.enabled = false
                 }
 
                 def depChangelog = depProps.getProperty('thedevs.test.liquibase.change-log') ?: depProps.getProperty('main.liquibase.change-log')
@@ -473,11 +476,16 @@ gradle.projectsEvaluated {
             def starterMainOutput = (starterProject != null && starterProject.pluginManager.hasPlugin('java')) ?
                 starterProject.sourceSets.main.output : p.files()
 
-            testAddon.classpath = p.files(classesDir, aggregateFile.parentFile) +
-                                  addonTestClasspath +
-                                  p.sourceSets.main.output +
-                                  starterMainOutput +
-                                  runtimeClasspath
+            testAddon.classpath = p.files({
+                if (testState.skippedPreRollout || testState.testsDisabled) {
+                    return p.files()
+                }
+                return p.files(classesDir, aggregateFile.parentFile) +
+                       addonTestClasspath +
+                       p.sourceSets.main.output +
+                       starterMainOutput +
+                       runtimeClasspath
+            })
 
             testAddon.useJUnitPlatform()
             testAddon.failOnNoDiscoveredTests = false

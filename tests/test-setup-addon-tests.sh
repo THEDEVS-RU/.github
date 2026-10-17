@@ -400,7 +400,17 @@ dependencies {
 EOF
 
 # In pre-rollout mode (default), missing tests artifact prints warning and succeeds
+set +e
 PRE_ROLLOUT_OUTPUT=$(cd "$STRICT_TEST_DIR" && gradle -I "$INIT_SCRIPT" testAddonDependencies --no-daemon 2>&1)
+PRE_RC=$?
+set -e
+
+if [ "$PRE_RC" -ne 0 ]; then
+  echo "FAIL: Build failed in pre-rollout mode with exit code $PRE_RC (expected success with warning)" >&2
+  echo "$PRE_ROLLOUT_OUTPUT" >&2
+  exit 1
+fi
+
 if ! echo "$PRE_ROLLOUT_OUTPUT" | grep -q "Skipped dependency tests for 'ru.thedevs:helper-test'"; then
   echo "FAIL: Pre-rollout warning not printed for missing tests artifact" >&2
   echo "$PRE_ROLLOUT_OUTPUT" >&2
