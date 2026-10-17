@@ -354,6 +354,11 @@ gradle.projectsEvaluated {
             } catch (Throwable ignored) {}
             p.dependencies.add(confName, "${depGroup}:${baseModule}-tests:${depVersion}")
 
+            def testTaskName = "testAddon_${baseModule}"
+            def testAddon = p.tasks.maybeCreate(testTaskName, Test)
+            testAddon.group = 'verification'
+            testAddon.description = "Runs tests of dependency ${depGroup}:${baseModule}"
+
             // 2. Unpack task and aggregate changelog generation
             def unpackTaskName = "unpackAddonTests_${baseModule}"
             def classesDir = p.layout.buildDirectory.dir("addon-tests/${baseModule}/classes").get().asFile
@@ -467,13 +472,8 @@ gradle.projectsEvaluated {
                 aggregateFile.text = xmlBuilder.toString()
             }
 
-            // 3. Test task
-            def testTaskName = "testAddon_${baseModule}"
-            def testAddon = p.tasks.maybeCreate(testTaskName, Test)
-            testAddon.group = 'verification'
-            testAddon.description = "Runs tests of dependency ${depGroup}:${baseModule}"
+            // 3. Configure test task
             testAddon.dependsOn(unpackTask)
-
             testAddon.testClassesDirs = p.files(classesDir)
 
             def starterProject = p.rootProject.subprojects.find { it.name.endsWith('-starter') }
