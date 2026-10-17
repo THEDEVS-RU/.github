@@ -54,7 +54,7 @@ inputs:
     required: false
     default: 'Dockerfile'
   claude_cli_version:
-    description: 'Resolved Claude CLI version to pass via --build-arg=CLAUDE_CLI_VERSION'
+    description: 'Resolved Claude CLI version to pass via --build-arg=CLAUDE_CLI_VERSION. If CLAUDE_CLI_VERSION is also provided in build_args, build_args takes precedence.'
     required: false
     default: ''
   dockerhub_username:
@@ -77,6 +77,18 @@ inputs:
     description: 'Number of retries for Kaniko image fs extract'
     required: false
     default: '0'
+  cpu_limit:
+    description: 'CPU limit for Kaniko pod container (e.g. 16000m, 8). Set to 0 or none to remove CPU limit. Empty/omitted defaults to 16000m.'
+    required: false
+    default: '16000m'
+  extra_tags:
+    description: 'Comma- or whitespace-separated extra tags for target image'
+    required: false
+    default: ''
+  build_args:
+    description: 'Multiline list of build arguments (one KEY=VALUE per line) to pass to Kaniko. Not for secrets (visible in pod YAML). Overrides claude_cli_version if CLAUDE_CLI_VERSION is specified.'
+    required: false
+    default: ''
 
 runs:
   using: "composite"
@@ -105,6 +117,9 @@ runs:
         INSECURE: ${{ inputs.insecure }}
         INSECURE_PULL: ${{ inputs.insecure_pull }}
         IMAGE_FS_EXTRACT_RETRY: ${{ inputs.image_fs_extract_retry }}
+        INPUT_CPU_LIMIT: ${{ inputs.cpu_limit }}
+        INPUT_EXTRA_TAGS: ${{ inputs.extra_tags }}
+        INPUT_BUILD_ARGS: ${{ inputs.build_args }}
         CACHEBUST: ${{ github.run_id }}-${{ github.run_attempt }}
         CALLER_REPO: ${{ github.repository }}
         CALLER_REF: ${{ github.ref_name }}
@@ -146,6 +161,92 @@ runs:
         NOT_FOUND_LIMIT=5
         TRANSIENT_RE='error resolving source|connection reset by peer|i/o timeout|TLS handshake timeout|unexpected EOF|no such host|temporary failure in name resolution|502 Bad Gateway|Evicted'
         CLONE_NOISE_RE='^(Enumerating objects:|Counting objects:|Compressing objects:|Receiving objects:|Resolving deltas:|remote:)'
+
+        # Validate and normalize cpu_limit
+        CPU_LIMIT="${INPUT_CPU_LIMIT:-16000m}"
+        CPU_LIMIT="${CPU_LIMIT#"${CPU_LIMIT%%[![:space:]]*}"}"
+        CPU_LIMIT="${CPU_LIMIT%"${CPU_LIMIT##*[![:space:]]}"}"
+        CPU_LIMIT="${CPU_LIMIT:-16000m}"
+        REMOVE_CPU_LIMIT=0
+        if [ "$CPU_LIMIT" = "0" ] || [ "$CPU_LIMIT" = "none" ]; then
+          REMOVE_CPU_LIMIT=1
+        else
+          if ! printf '%s' "$CPU_LIMIT" | grep -qE '^([0-9]+m|[0-9]+([.][0-9]+)?)$'; then
+            echo "::error::Invalid cpu_limit format: '$CPU_LIMIT'. Must be Kubernetes CPU quantity (e.g. 16000m, 8), 0, or none."
+            exit 1
+          fi
+          case "$CPU_LIMIT" in
+            *m)
+              CPU_MILLIS=$((10#${CPU_LIMIT%m}))
+              ;;
+            *.*)
+              CPU_MILLIS=$(awk -v val="$CPU_LIMIT" 'BEGIN { printf "%.0f", val * 1000 }')
+              ;;
+            *)
+              CPU_MILLIS=$((10#$CPU_LIMIT * 1000))
+              ;;
+          esac
+          if [ "$CPU_MILLIS" -lt 1000 ]; then
+            echo "::error::cpu_limit '$CPU_LIMIT' (${CPU_MILLIS}m) cannot be less than requests.cpu (1000m). Set to 0 or none to remove limit."
+            exit 1
+          fi
+        fi
+
+        # Validate and parse extra_tags
+        VALIDATED_EXTRA_TAGS=()
+        if [ -n "$INPUT_EXTRA_TAGS" ]; then
+          while IFS= read -r tag_line || [ -n "$tag_line" ]; do
+            tag_line="${tag_line#"${tag_line%%[![:space:]]*}"}"
+            tag_line="${tag_line%"${tag_line##*[![:space:]]}"}"
+            [ -z "$tag_line" ] && continue
+            tag_line=$(printf '%s' "$tag_line" | tr ',' ' ')
+            set -f
+            for single_tag in $tag_line; do
+              [ -z "$single_tag" ] && continue
+              if ! printf '%s' "$single_tag" | grep -qE '^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$'; then
+                echo "::error::Invalid docker tag format in extra_tags: '$single_tag'."
+                set +f
+                exit 1
+              fi
+              VALIDATED_EXTRA_TAGS+=("$single_tag")
+            done
+            set +f
+          done <<< "$INPUT_EXTRA_TAGS"
+        fi
+
+        # Validate and parse build_args
+        VALIDATED_BUILD_ARGS=()
+        if [ -n "$INPUT_BUILD_ARGS" ]; then
+          while IFS= read -r line || [ -n "$line" ]; do
+            line="${line#"${line%%[![:space:]]*}"}"
+            line="${line%"${line##*[![:space:]]}"}"
+            [ -z "$line" ] && continue
+            case "$line" in
+              '#'*) continue ;;
+            esac
+            if ! printf '%s' "$line" | grep -qE '^[A-Za-z_][A-Za-z0-9_]*='; then
+              echo "::error::Invalid build_args line: '$line'. Must match KEY=VALUE syntax."
+              exit 1
+            fi
+            if printf '%s' "$line" | grep -qE '["\\]'; then
+              echo "::error::Invalid build_args line: '$line'. Quotes (\") and backslashes (\\) are forbidden."
+              exit 1
+            fi
+            VALIDATED_BUILD_ARGS+=("$line")
+          done <<< "$INPUT_BUILD_ARGS"
+        fi
+
+        HAS_CLAUDE_CLI_ARG=0
+        for BARG in "${VALIDATED_BUILD_ARGS[@]}"; do
+          if [ "${BARG%%=*}" = "CLAUDE_CLI_VERSION" ]; then
+            HAS_CLAUDE_CLI_ARG=1
+            break
+          fi
+        done
+
+        if [ -n "$CLAUDE_CLI_VERSION" ] && [ "$HAS_CLAUDE_CLI_ARG" -eq 1 ]; then
+          echo "::warning::CLAUDE_CLI_VERSION provided via both claude_cli_version and build_args. build_args takes precedence."
+        fi
 
         if [ -n "$SECRET" ]; then
           echo "Verifying docker secret '$SECRET' in namespace '$NS'..."
@@ -252,14 +353,26 @@ runs:
             args:
             - "--context=git://x-access-token:${GIT_TOKEN}@${REPO}#refs/heads/${BRANCH}"
             - "--destination=${IMAGE_FULL}"
+        EOF
+              for EXTRA_TAG in "${VALIDATED_EXTRA_TAGS[@]}"; do
+                cat <<EOF
+            - "--destination=${IMAGE}:${EXTRA_TAG}"
+        EOF
+              done
+              cat <<EOF
             - "--dockerfile=${DOCKERFILE}"
             - "--build-arg=CACHEBUST=${CACHEBUST}"
         EOF
-              if [ -n "$CLAUDE_CLI_VERSION" ]; then
+              if [ -n "$CLAUDE_CLI_VERSION" ] && [ "$HAS_CLAUDE_CLI_ARG" -eq 0 ]; then
                 cat <<EOF
             - "--build-arg=CLAUDE_CLI_VERSION=${CLAUDE_CLI_VERSION}"
         EOF
               fi
+              for BARG in "${VALIDATED_BUILD_ARGS[@]}"; do
+                cat <<EOF
+            - "--build-arg=${BARG}"
+        EOF
+              done
               if [ "$INSECURE" = "true" ]; then
                 cat <<EOF
             - "--insecure"
@@ -285,7 +398,13 @@ runs:
                 cpu: "1000m"
               limits:
                 memory: "8Gi"
-                cpu: "3000m"
+        EOF
+              if [ "$REMOVE_CPU_LIMIT" -eq 0 ]; then
+                cat <<EOF
+                cpu: "${CPU_LIMIT}"
+        EOF
+              fi
+              cat <<EOF
             volumeMounts:
             - name: docker-config
               mountPath: /kaniko/.docker
