@@ -381,10 +381,10 @@ echo "Downstream testAddon execution validation: PASSED"
 # 5. Validate Strict Mode vs Pre-rollout for missing tests artifact
 echo "Testing strict mode vs pre-rollout mode behavior..."
 
-STRICT_TEST_DIR="$TEST_DIR/strict-test"
+STRICT_TEST_DIR="$TEST_DIR/strict-consumer"
 mkdir -p "$STRICT_TEST_DIR"
 cat > "$STRICT_TEST_DIR/settings.gradle" <<'EOF'
-rootProject.name = 'strict-test'
+rootProject.name = 'strict-consumer'
 EOF
 cat > "$STRICT_TEST_DIR/build.gradle" <<EOF
 plugins {
