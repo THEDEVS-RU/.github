@@ -381,6 +381,43 @@ echo "Downstream testAddon execution validation: PASSED"
 # 5. Validate Strict Mode vs Pre-rollout for missing tests artifact
 echo "Testing strict mode vs pre-rollout mode behavior..."
 
+PRE_TEST_DIR="$TEST_DIR/prerollout-consumer"
+mkdir -p "$PRE_TEST_DIR"
+cat > "$PRE_TEST_DIR/settings.gradle" <<'EOF'
+rootProject.name = 'prerollout-consumer'
+EOF
+cat > "$PRE_TEST_DIR/build.gradle" <<EOF
+plugins {
+    id 'java'
+}
+repositories {
+    maven { url = uri("${REPO_DIR}") }
+    mavenCentral()
+}
+dependencies {
+    implementation 'ru.thedevs:helper-test:1.0.0'
+}
+EOF
+
+# In pre-rollout mode (default), missing tests artifact prints warning and succeeds
+set +e
+PRE_ROLLOUT_OUTPUT=$(cd "$PRE_TEST_DIR" && gradle -I "$INIT_SCRIPT" testAddonDependencies --no-daemon 2>&1)
+PRE_RC=$?
+set -e
+
+if [ "$PRE_RC" -ne 0 ]; then
+  echo "FAIL: Build failed in pre-rollout mode with exit code $PRE_RC (expected success with warning)" >&2
+  echo "$PRE_ROLLOUT_OUTPUT" >&2
+  exit 1
+fi
+
+if ! echo "$PRE_ROLLOUT_OUTPUT" | grep -q "Skipped dependency tests for 'ru.thedevs:helper-test'"; then
+  echo "FAIL: Pre-rollout warning not printed for missing tests artifact" >&2
+  echo "$PRE_ROLLOUT_OUTPUT" >&2
+  exit 1
+fi
+
+# In strict mode (-Pthedevs.tests.strict=true), missing tests artifact must fail
 STRICT_TEST_DIR="$TEST_DIR/strict-consumer"
 mkdir -p "$STRICT_TEST_DIR"
 cat > "$STRICT_TEST_DIR/settings.gradle" <<'EOF'
@@ -399,25 +436,6 @@ dependencies {
 }
 EOF
 
-# In pre-rollout mode (default), missing tests artifact prints warning and succeeds
-set +e
-PRE_ROLLOUT_OUTPUT=$(cd "$STRICT_TEST_DIR" && gradle -I "$INIT_SCRIPT" testAddonDependencies --no-daemon 2>&1)
-PRE_RC=$?
-set -e
-
-if [ "$PRE_RC" -ne 0 ]; then
-  echo "FAIL: Build failed in pre-rollout mode with exit code $PRE_RC (expected success with warning)" >&2
-  echo "$PRE_ROLLOUT_OUTPUT" >&2
-  exit 1
-fi
-
-if ! echo "$PRE_ROLLOUT_OUTPUT" | grep -q "Skipped dependency tests for 'ru.thedevs:helper-test'"; then
-  echo "FAIL: Pre-rollout warning not printed for missing tests artifact" >&2
-  echo "$PRE_ROLLOUT_OUTPUT" >&2
-  exit 1
-fi
-
-# In strict mode (-Pthedevs.tests.strict=true), missing tests artifact must fail
 set +e
 STRICT_OUTPUT=$(cd "$STRICT_TEST_DIR" && gradle -I "$INIT_SCRIPT" testAddonDependencies -Pthedevs.tests.strict=true --no-daemon 2>&1)
 STRICT_RC=$?
@@ -425,6 +443,7 @@ set -e
 
 if [ "$STRICT_RC" -eq 0 ]; then
   echo "FAIL: Build succeeded in strict mode with missing tests artifact, but must fail!" >&2
+  echo "$STRICT_OUTPUT" >&2
   exit 1
 fi
 
