@@ -85,6 +85,7 @@ dependencies {
 publishing {
     publications {
         javaMaven(MavenPublication) {
+            artifactId = base.archivesName.get()
             from components.java
         }
     }
