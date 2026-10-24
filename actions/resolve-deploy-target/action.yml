@@ -3,7 +3,7 @@ description: 'Determines whether to deploy to Kubernetes or via SSH Compose base
 
 inputs:
   deploy_config_k8s:
-    description: 'Kubernetes kubeconfig string (DEPLOY_CONFIG_K8S or KUBE_CONFIG)'
+    description: 'Kubernetes kubeconfig string (secrets.DEPLOY_CONFIG_K8S)'
     required: false
     default: ''
   ssh_host:
@@ -15,11 +15,11 @@ inputs:
     required: false
     default: ''
   ssh_key:
-    description: 'SSH private key (secrets.SSH_PRIVATE_KEY or secrets.SSH_KEY)'
+    description: 'SSH private key (secrets.SSH_PRIVATE_KEY)'
     required: false
     default: ''
   ssh_known_hosts:
-    description: 'SSH known_hosts string (secrets.SSH_KNOWN_HOSTS)'
+    description: 'SSH known_hosts string (vars.SSH_KNOWN_HOSTS)'
     required: false
     default: ''
 
