@@ -5,7 +5,6 @@ inputs:
   namespace:
     description: 'Target Kubernetes namespace'
     required: true
-    default: 'dev'
   token:
     description: 'LK MCP service token (from secrets.THEDEVS_LK_MCP_TOKEN)'
     required: false

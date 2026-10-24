@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-TARGET_NS="${TARGET_NS:-dev}"
+TARGET_NS="${TARGET_NS:-}"
+if [ -z "$TARGET_NS" ]; then
+  echo "::error::Input 'namespace' is required and cannot be empty." >&2
+  exit 1
+fi
 SECRET_NAME="${SECRET_NAME:-thedevs-lk-mcp}"
 TOKEN="${TOKEN:-}"
 URL="${URL:-}"
