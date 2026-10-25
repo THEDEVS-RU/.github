@@ -89,6 +89,18 @@ inputs:
     description: 'Multiline list of build arguments (one KEY=VALUE per line) to pass to Kaniko. Not for secrets (visible in pod YAML). Overrides claude_cli_version if CLAUDE_CLI_VERSION is specified.'
     required: false
     default: ''
+  gradle_secret:
+    description: 'Pre-existing Kubernetes Secret name in namespace with gradle.properties key. Default: empty (opt-in).'
+    required: false
+    default: ''
+  gradle_username:
+    description: 'Username for Gradle private repository auth (repo.thedevs.ru). Must be provided together with gradle_password.'
+    required: false
+    default: ''
+  gradle_password:
+    description: 'Password for Gradle private repository auth (repo.thedevs.ru). Must be provided together with gradle_username.'
+    required: false
+    default: ''
 
 runs:
   using: "composite"
@@ -120,6 +132,9 @@ runs:
         INPUT_CPU_LIMIT: ${{ inputs.cpu_limit }}
         INPUT_EXTRA_TAGS: ${{ inputs.extra_tags }}
         INPUT_BUILD_ARGS: ${{ inputs.build_args }}
+        INPUT_GRADLE_SECRET: ${{ inputs.gradle_secret }}
+        INPUT_GRADLE_USERNAME: ${{ inputs.gradle_username }}
+        INPUT_GRADLE_PASSWORD: ${{ inputs.gradle_password }}
         CACHEBUST: ${{ github.run_id }}-${{ github.run_attempt }}
         CALLER_REPO: ${{ github.repository }}
         CALLER_REF: ${{ github.ref_name }}
@@ -290,6 +305,57 @@ runs:
           fi
         fi
 
+        GRADLE_SECRET="$(trim "${INPUT_GRADLE_SECRET:-}")"
+        GRADLE_USERNAME="${INPUT_GRADLE_USERNAME:-}"
+        GRADLE_PASSWORD="${INPUT_GRADLE_PASSWORD:-}"
+
+        if [[ "$GRADLE_USERNAME" == *$'\r'* ]] || [[ "$GRADLE_USERNAME" == *$'\n'* ]] || \
+           [[ "$GRADLE_PASSWORD" == *$'\r'* ]] || [[ "$GRADLE_PASSWORD" == *$'\n'* ]]; then
+          echo "::error::gradle_username and gradle_password must not contain CR or LF characters."
+          exit 1
+        fi
+
+        if [ -n "$GRADLE_USERNAME" ] && [ -z "$GRADLE_PASSWORD" ]; then
+          echo "::error::Both gradle_username and gradle_password must be specified together."
+          exit 1
+        fi
+        if [ -z "$GRADLE_USERNAME" ] && [ -n "$GRADLE_PASSWORD" ]; then
+          echo "::error::Both gradle_username and gradle_password must be specified together."
+          exit 1
+        fi
+
+        USE_TEMP_GRADLE_SECRET=0
+        GRADLE_SECRET_NAME=""
+        if [ -n "$GRADLE_USERNAME" ] && [ -n "$GRADLE_PASSWORD" ]; then
+          USE_TEMP_GRADLE_SECRET=1
+        elif [ -n "$GRADLE_SECRET" ]; then
+          GRADLE_SECRET_NAME="$GRADLE_SECRET"
+          echo "Verifying gradle secret '$GRADLE_SECRET' in namespace '$NS'..."
+          GRADLE_SECRET_CHECK_ERR=$(kubectl -n "$NS" get secret "$GRADLE_SECRET" --request-timeout=15s 2>&1 >/dev/null || true)
+          if [ -n "$GRADLE_SECRET_CHECK_ERR" ]; then
+            if printf '%s' "$GRADLE_SECRET_CHECK_ERR" | grep -F -q 'NotFound'; then
+              echo "::error::Gradle secret '$GRADLE_SECRET' specified but not found in namespace '$NS'"
+              exit 1
+            else
+              echo "::warning::Could not verify gradle secret '$GRADLE_SECRET' in namespace '$NS' (proceeding with volume mount): $GRADLE_SECRET_CHECK_ERR"
+            fi
+          fi
+        fi
+
+        CREATED_GRADLE_SECRETS=()
+        GRADLE_PROP_FILE=""
+
+        cleanup_gradle_secrets() {
+          [ -n "${GRADLE_PROP_FILE:-}" ] && rm -f "$GRADLE_PROP_FILE" 2>/dev/null || true
+          if [ "$USE_TEMP_GRADLE_SECRET" -eq 1 ]; then
+            for s in "${CREATED_GRADLE_SECRETS[@]}"; do
+              [ -n "$s" ] && kubectl -n "$NS" delete secret "$s" --ignore-not-found --wait=false --request-timeout=30s >/dev/null 2>&1 || true
+            done
+          fi
+        }
+        trap cleanup_gradle_secrets EXIT
+        trap 'cleanup_gradle_secrets; exit 130' INT TERM
+
         ATTEMPT=1
         while [ "$ATTEMPT" -le "$MAX_ATTEMPTS" ]; do
           POD="${POD_NAME}-a${ATTEMPT}"
@@ -299,6 +365,52 @@ runs:
           echo "BUILD_ATTEMPT: $ATTEMPT/$MAX_ATTEMPTS"
           kubectl -n "$NS" delete pod "$POD" --force --grace-period=0 --ignore-not-found --request-timeout=30s >/dev/null 2>&1
           sleep 1
+
+          if [ "$USE_TEMP_GRADLE_SECRET" -eq 1 ]; then
+            GRADLE_SECRET_NAME="${POD}-gradle"
+            GRADLE_PROP_FILE="${RUNNER_TEMP:-/tmp}/${POD}-gradle.properties"
+
+            # Экранирование обратного слэша для формата java.util.Properties
+            GRADLE_USER_ESCAPED="${GRADLE_USERNAME//\\/\\\\}"
+            GRADLE_PASS_ESCAPED="${GRADLE_PASSWORD//\\/\\\\}"
+
+            (
+              umask 077
+              cat > "$GRADLE_PROP_FILE" <<EOF
+        thedevsRepoUser=$GRADLE_USER_ESCAPED
+        thedevsRepoPassword=$GRADLE_PASS_ESCAPED
+        uploadUser=$GRADLE_USER_ESCAPED
+        uploadPassword=$GRADLE_PASS_ESCAPED
+        EOF
+            )
+            chmod 600 "$GRADLE_PROP_FILE"
+
+            # Выполнение в подоболочке с set -o pipefail для корректного перехвата ошибок любой команды пайпа
+            APPLY_SECRET_OUT=$( (set -o pipefail; kubectl -n "$NS" create secret generic "$GRADLE_SECRET_NAME" \
+              --from-file="gradle.properties=$GRADLE_PROP_FILE" \
+              --dry-run=client -o yaml | kubectl apply --request-timeout=30s -f -) 2>&1 )
+            APPLY_SECRET_RC=$?
+            rm -f "$GRADLE_PROP_FILE"
+
+            if [ "$APPLY_SECRET_RC" -ne 0 ]; then
+              if printf '%s' "$APPLY_SECRET_OUT" | grep -F -q 'Forbidden'; then
+                echo "::error::RBAC permission denied to create temporary gradle secret '$GRADLE_SECRET_NAME' in namespace '$NS'. Ensure the service account from BUILDER_CONFIG_K8S has 'create' and 'delete' verbs on 'secrets'. Details: $(printf '%s' "$APPLY_SECRET_OUT" | tr '\n' ' ' | cut -c1-200)"
+                exit 1
+              fi
+              if [ "$ATTEMPT" -lt "$MAX_ATTEMPTS" ]; then
+                BACKOFF=10
+                [ "$ATTEMPT" -eq 2 ] && BACKOFF=30
+                echo "Transient failure creating gradle secret — retrying in ${BACKOFF}s"
+                sleep "$BACKOFF"
+                ATTEMPT=$((ATTEMPT + 1))
+                continue
+              fi
+              echo "::error::Failed to create temporary gradle secret '$GRADLE_SECRET_NAME' in namespace '$NS': $(printf '%s' "$APPLY_SECRET_OUT" | tr '\n' ' ' | cut -c1-200)"
+              exit 1
+            fi
+
+            CREATED_GRADLE_SECRETS+=("$GRADLE_SECRET_NAME")
+          fi
 
           echo "BUILD_START: $IMAGE_FULL"
           APPLY_OUT=$(
@@ -449,6 +561,16 @@ runs:
               subPath: npm-cache
             - name: project-cache
               mountPath: /root/.gradle/caches
+        EOF
+              if [ -n "$GRADLE_SECRET_NAME" ]; then
+                cat <<EOF
+            - name: gradle-secret
+              mountPath: /root/.gradle/gradle.properties
+              subPath: gradle.properties
+              readOnly: true
+        EOF
+              fi
+              cat <<EOF
           restartPolicy: Never
           volumes:
         EOF
@@ -475,12 +597,26 @@ runs:
             persistentVolumeClaim:
               claimName: ${CACHE_PVC}
         EOF
+              if [ -n "$GRADLE_SECRET_NAME" ]; then
+                cat <<EOF
+          - name: gradle-secret
+            secret:
+              secretName: $GRADLE_SECRET_NAME
+              items:
+              - key: gradle.properties
+                path: gradle.properties
+              defaultMode: 0400
+        EOF
+              fi
             } | kubectl apply --request-timeout=30s -f - 2>&1
           )
           APPLY_RC=$?
           printf '%s\n' "$APPLY_OUT"
 
           if [ "$APPLY_RC" -ne 0 ]; then
+            if [ "$USE_TEMP_GRADLE_SECRET" -eq 1 ]; then
+              kubectl -n "$NS" delete secret "$GRADLE_SECRET_NAME" --ignore-not-found --wait=false --request-timeout=30s >/dev/null 2>&1 || true
+            fi
             if [ "$ATTEMPT" -lt "$MAX_ATTEMPTS" ]; then
               BACKOFF=10
               [ "$ATTEMPT" -eq 2 ] && BACKOFF=30
@@ -491,6 +627,19 @@ runs:
             fi
             echo "BUILD_FAILED: kubectl apply failed: $(printf '%s' "$APPLY_OUT" | tr '\n' ' ' | cut -c1-200)"
             exit 1
+          fi
+
+          if [ "$USE_TEMP_GRADLE_SECRET" -eq 1 ]; then
+            POD_UID=$(kubectl -n "$NS" get pod "$POD" -o jsonpath='{.metadata.uid}' --request-timeout=15s 2>/dev/null || true)
+            if [ -n "$POD_UID" ]; then
+              PATCH_ERR=$(kubectl -n "$NS" patch secret "$GRADLE_SECRET_NAME" --type=merge --request-timeout=15s \
+                -p "{\"metadata\":{\"ownerReferences\":[{\"apiVersion\":\"v1\",\"kind\":\"Pod\",\"name\":\"$POD\",\"uid\":\"$POD_UID\",\"blockOwnerDeletion\":false}]}}" 2>&1 >/dev/null || true)
+              if [ -n "$PATCH_ERR" ]; then
+                echo "::warning::Failed to set ownerReferences on secret '$GRADLE_SECRET_NAME': $PATCH_ERR"
+              fi
+            else
+              echo "::warning::Could not obtain UID of pod '$POD' to set ownerReferences on secret '$GRADLE_SECRET_NAME'"
+            fi
           fi
 
           timeout 300s sh -c 'until kubectl -n "'"$NS"'" wait --for=condition=Ready "pod/'"$POD"'" --timeout=60s --request-timeout=30s 2>/dev/null; do sleep 5; done' || true
