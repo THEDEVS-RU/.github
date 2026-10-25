@@ -35,6 +35,9 @@
 | `cpu_limit` | Лимит CPU для пода Kaniko (например, `16000m`, `8`). `0`, `0m` или `none` снимают лимит. Минимум — `requests.cpu` (`1000m`) | Нет | `'16000m'` |
 | `extra_tags` | Дополнительные теги через запятую или пробел/перевод строки | Нет | `''` |
 | `build_args` | Построчный список аргументов сборки (`KEY=VALUE`, без секретов). Имеет приоритет над `claude_cli_version` | Нет | `''` |
+| `gradle_secret` | Имя существующего K8s-секрета в namespace с ключом `gradle.properties` для аутентификации в Gradle-репозиториях (opt-in) | Нет | `''` |
+| `gradle_username` | Имя пользователя для аутентификации в приватном репозитории Gradle (`repo.thedevs.ru`). Передаётся строго вместе с `gradle_password` | Нет | `''` |
+| `gradle_password` | Пароль для аутентификации в приватном репозитории Gradle (`repo.thedevs.ru`). Передаётся строго вместе с `gradle_username` | Нет | `''` |
 
 ## Встроенная Pre-flight проверка секрета реестра
 
@@ -62,7 +65,48 @@ rules:
     verbs: ["get"]
 ```
 
+## Передача секретов Gradle (`gradle_username` / `gradle_password` / `gradle_secret`)
+
+Для сборки проектов, зависящих от закрытых snapshot-репозиториев артефактов (`repo.thedevs.ru`), экшен поддерживает безопасную передачу учетных данных Gradle в сборочный под Kaniko без сохранения паролей в Dockerfile, `--build-arg`, `env.value` или метаданных пода.
+
+### Схема работы:
+1. **Эфемерный секрет из учетных данных (`gradle_username` + `gradle_password`):**
+   - На каждую попытку сборки экшен генерирует временный K8s-секрет `${POD}-gradle` (с `umask 077` и экранированием `\` как `\\`), содержащий канонический файл `gradle.properties` со свойствами `thedevsRepoUser`, `thedevsRepoPassword`, `uploadUser`, `uploadPassword`.
+   - Создание выполняется через пайп `kubectl create secret generic --dry-run=client -o yaml | kubectl apply -f -` под `set -o pipefail`.
+   - На созданный секрет проставляется `ownerReferences` на под Kaniko, что гарантирует автоматическое удаление секрета Kubernetes Garbage Collector-ом при аварийном завершении раннера (`SIGKILL`).
+   - Имена созданных секретов аккумулируются в массиве `CREATED_GRADLE_SECRETS` и гарантированно удаляются через `trap` при завершении экшена (успешном или с ошибкой), а также немедленно при сбое попытки `kubectl apply` пода.
+2. **Монтирование постоянного секрета (`gradle_secret`):**
+   - Если передан существующий секрет `gradle_secret`, выполняется fail-fast pre-flight проверка: при статусе `NotFound` экшен немедленно завершается с кодом 1, исключая зависание пода в `ContainerCreating`.
+3. **Прямое монтирование в Kaniko (без init-контейнеров):**
+   - Секрет монтируется напрямую в контейнер `kaniko` как том `secret` с правами `defaultMode: 0400` в точку монтирования `/root/.gradle/gradle.properties` (`subPath: gradle.properties`, `readOnly: true`).
+   - При отсутствии параметров `gradle_*` монтирование не производится, манифест пода сохраняет стандартный вид.
+
+### Требования к RBAC для работы с секретами:
+Сервисный аккаунт сборочного раннера (`BUILDER_CONFIG_K8S`) должен обладать правами `get`, `create`, `delete` и `patch` на ресурс `secrets` в пространстве имен сборщика (`BUILD_NAMESPACE`):
+
+```yaml
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "create", "delete", "patch"]
+```
+
 ## Примеры использования
+
+### Сборка с учетными данными Gradle из GitHub Secrets (рекомендуется для JVM)
+
+```yaml
+- name: Build container image
+  uses: THEDEVS-RU/.github/actions/kaniko-build@dev
+  with:
+    image: ${{ env.IMAGE_NAME }}
+    tag: ${{ env.IMAGE_TAG }}
+    namespace: ${{ vars.BUILD_NAMESPACE }}
+    git_token: ${{ secrets.GITHUB_TOKEN }}
+    cache_pvc: ${{ env.CACHE_PVC }}
+    gradle_username: ${{ secrets.MAVEN_USERNAME }}
+    gradle_password: ${{ secrets.MAVEN_PASSWORD }}
+```
 
 ### Сборка с аутентификацией через GitHub Secret (рекомендуется)
 
