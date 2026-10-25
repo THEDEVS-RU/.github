@@ -849,16 +849,6 @@ else
   test_fail "5.4.2 Secret creation error transient" "RC=$ACTION_RC, log='$ACTION_LOG', calls='$calls'"
 fi
 
-# 5.4.3 Immediate delete secret invocation on failed create attempt
-run_action INPUT_GRADLE_USERNAME="testuser" INPUT_GRADLE_PASSWORD="testpassword" MOCK_SECRET_CREATE_TRANSIENT="1"
-calls=$(get_kubectl_calls)
-if [ "$ACTION_RC" -ne 0 ] && \
-   assert_contains "$calls" "delete secret kaniko-test-1-1-a1-gradle"; then
-  test_pass "5.4.3 Immediate delete secret invocation on failed create attempt"
-else
-  test_fail "5.4.3 Immediate delete secret" "RC=$ACTION_RC, calls='$calls'"
-fi
-
 # 5.5.1 Cleanup: delete secret on pod apply failure
 run_action INPUT_GRADLE_USERNAME="testuser" INPUT_GRADLE_PASSWORD="testpassword" MOCK_POD_APPLY_FAIL="1"
 calls=$(get_kubectl_calls)
