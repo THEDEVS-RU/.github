@@ -288,9 +288,14 @@ runs:
           echo "::warning::CLAUDE_CLI_VERSION provided via both claude_cli_version and build_args. build_args takes precedence."
         fi
 
+        check_secret_exists() {
+          local s_name="$1"
+          kubectl -n "$NS" get secret "$s_name" --request-timeout=15s 2>&1 >/dev/null || true
+        }
+
         if [ -n "$SECRET" ]; then
           echo "Verifying docker secret '$SECRET' in namespace '$NS'..."
-          SECRET_CHECK_ERR=$(kubectl -n "$NS" get secret "$SECRET" --request-timeout=15s 2>&1 >/dev/null || true)
+          SECRET_CHECK_ERR=$(check_secret_exists "$SECRET")
           if [ -n "$SECRET_CHECK_ERR" ]; then
             if printf '%s' "$SECRET_CHECK_ERR" | grep -F -q 'NotFound'; then
               if [ -n "$REGISTRY_TOKEN" ]; then
@@ -315,6 +320,16 @@ runs:
           exit 1
         fi
 
+        if [[ "$GRADLE_USERNAME" =~ ^[[:space:]] ]] || [[ "$GRADLE_PASSWORD" =~ ^[[:space:]] ]]; then
+          echo "::error::gradle_username and gradle_password must not contain leading whitespace."
+          exit 1
+        fi
+
+        if LC_ALL=C grep -q "[^ -~]" <<< "$GRADLE_USERNAME" || LC_ALL=C grep -q "[^ -~]" <<< "$GRADLE_PASSWORD"; then
+          echo "::error::gradle_username and gradle_password must contain only printable ASCII characters."
+          exit 1
+        fi
+
         if [ -n "$GRADLE_USERNAME" ] && [ -z "$GRADLE_PASSWORD" ]; then
           echo "::error::Both gradle_username and gradle_password must be specified together."
           exit 1
@@ -328,10 +343,13 @@ runs:
         GRADLE_SECRET_NAME=""
         if [ -n "$GRADLE_USERNAME" ] && [ -n "$GRADLE_PASSWORD" ]; then
           USE_TEMP_GRADLE_SECRET=1
+          if [ -n "$GRADLE_SECRET" ]; then
+            echo "::warning::Both gradle credentials (gradle_username/gradle_password) and gradle_secret provided. Ephemeral secret from credentials takes precedence; gradle_secret '$GRADLE_SECRET' is ignored."
+          fi
         elif [ -n "$GRADLE_SECRET" ]; then
           GRADLE_SECRET_NAME="$GRADLE_SECRET"
           echo "Verifying gradle secret '$GRADLE_SECRET' in namespace '$NS'..."
-          GRADLE_SECRET_CHECK_ERR=$(kubectl -n "$NS" get secret "$GRADLE_SECRET" --request-timeout=15s 2>&1 >/dev/null || true)
+          GRADLE_SECRET_CHECK_ERR=$(check_secret_exists "$GRADLE_SECRET")
           if [ -n "$GRADLE_SECRET_CHECK_ERR" ]; then
             if printf '%s' "$GRADLE_SECRET_CHECK_ERR" | grep -F -q 'NotFound'; then
               echo "::error::Gradle secret '$GRADLE_SECRET' specified but not found in namespace '$NS'"
@@ -385,16 +403,20 @@ runs:
             )
             chmod 600 "$GRADLE_PROP_FILE"
 
-            # Выполнение в подоболочке с set -o pipefail для корректного перехвата ошибок любой команды пайпа
-            APPLY_SECRET_OUT=$( (set -o pipefail; kubectl -n "$NS" create secret generic "$GRADLE_SECRET_NAME" \
+            APPLY_SECRET_OUT=$(kubectl -n "$NS" create secret generic "$GRADLE_SECRET_NAME" \
               --from-file="gradle.properties=$GRADLE_PROP_FILE" \
-              --dry-run=client -o yaml | kubectl apply --request-timeout=30s -f -) 2>&1 )
+              --request-timeout=30s 2>&1)
             APPLY_SECRET_RC=$?
             rm -f "$GRADLE_PROP_FILE"
 
+            # Register secret for cleanup before checking rc (spec §3.1).
+            # If request times out client-side but succeeds on server, it will still be deleted on exit.
+            CREATED_GRADLE_SECRETS+=("$GRADLE_SECRET_NAME")
+
             if [ "$APPLY_SECRET_RC" -ne 0 ]; then
+              kubectl -n "$NS" delete secret "$GRADLE_SECRET_NAME" --ignore-not-found --wait=false --request-timeout=30s >/dev/null 2>&1 || true
               if printf '%s' "$APPLY_SECRET_OUT" | grep -F -q 'Forbidden'; then
-                echo "::error::RBAC permission denied to create temporary gradle secret '$GRADLE_SECRET_NAME' in namespace '$NS'. Ensure the service account from BUILDER_CONFIG_K8S has 'create' and 'delete' verbs on 'secrets'. Details: $(printf '%s' "$APPLY_SECRET_OUT" | tr '\n' ' ' | cut -c1-200)"
+                echo "::error::RBAC permission denied to create temporary gradle secret '$GRADLE_SECRET_NAME' in namespace '$NS'. Ensure the service account from BUILDER_CONFIG_K8S has 'get', 'create', 'delete', and 'patch' verbs on 'secrets'. Details: $(printf '%s' "$APPLY_SECRET_OUT" | tr '\n' ' ' | cut -c1-200)"
                 exit 1
               fi
               if [ "$ATTEMPT" -lt "$MAX_ATTEMPTS" ]; then
@@ -408,8 +430,6 @@ runs:
               echo "::error::Failed to create temporary gradle secret '$GRADLE_SECRET_NAME' in namespace '$NS': $(printf '%s' "$APPLY_SECRET_OUT" | tr '\n' ' ' | cut -c1-200)"
               exit 1
             fi
-
-            CREATED_GRADLE_SECRETS+=("$GRADLE_SECRET_NAME")
           fi
 
           echo "BUILD_START: $IMAGE_FULL"

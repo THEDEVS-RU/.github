@@ -43,6 +43,10 @@ fi
 cat > "$BIN_DIR/kubectl" <<'EOF'
 #!/usr/bin/env bash
 
+if [ -n "${KUBECTL_ARGV_LOG:-}" ]; then
+  echo "kubectl $@" >> "$KUBECTL_ARGV_LOG"
+fi
+
 cmd=""
 secret_name=""
 pod_name=""
@@ -71,10 +75,6 @@ for ((i=0; i<${#args[@]}; i++)); do
 done
 
 if [ "$cmd" = "create_secret" ]; then
-  if [ "${MOCK_CREATE_SECRET_FAIL:-0}" -eq 1 ]; then
-    echo "Error from server: dry-run create secret failed" >&2
-    exit 1
-  fi
   for arg in "$@"; do
     if [[ "$arg" =~ ^--from-file=(.*) ]]; then
       file_spec="${BASH_REMATCH[1]}"
@@ -91,27 +91,21 @@ if [ "$cmd" = "create_secret" ]; then
   if [ -n "${KUBECTL_CALLS_LOG:-}" ]; then
     echo "create secret generic $secret_name" >> "$KUBECTL_CALLS_LOG"
   fi
-  cat <<YAML
-apiVersion: v1
-kind: Secret
-metadata:
-  name: $secret_name
-type: Opaque
-YAML
+  if [ "${MOCK_SECRET_CREATE_FORBIDDEN:-0}" -eq 1 ]; then
+    echo "Error from server (Forbidden): secrets is forbidden: User \"system:serviceaccount:test-ns:builder-sa\" cannot create resource \"secrets\" in API group \"\" in the namespace \"test-ns\"" >&2
+    exit 1
+  fi
+  if [ "${MOCK_SECRET_CREATE_TRANSIENT:-0}" -eq 1 ]; then
+    echo "Error from server: connection reset by peer" >&2
+    exit 1
+  fi
+  echo "secret/$secret_name created"
   exit 0
 elif [ "$cmd" = "apply" ]; then
   STDIN_DATA=$(cat)
   if printf '%s' "$STDIN_DATA" | grep -F -q 'kind: Secret'; then
     if [ -n "${KUBECTL_CALLS_LOG:-}" ]; then
       echo "apply secret" >> "$KUBECTL_CALLS_LOG"
-    fi
-    if [ "${MOCK_SECRET_APPLY_FORBIDDEN:-0}" -eq 1 ]; then
-      echo "Error from server (Forbidden): secrets is forbidden: User \"system:serviceaccount:test-ns:builder-sa\" cannot create resource \"secrets\" in API group \"\" in the namespace \"test-ns\"" >&2
-      exit 1
-    fi
-    if [ "${MOCK_SECRET_APPLY_TRANSIENT:-0}" -eq 1 ]; then
-      echo "Error from server: connection reset by peer" >&2
-      exit 1
     fi
     echo "secret/mock-secret created"
     exit 0
@@ -208,16 +202,16 @@ ACTION_LOG=""
 
 run_action() {
   local output_file="$TEST_DIR/action.log"
-  rm -f "$CAPTURED_YAML" "$output_file" "$TEST_DIR/kubectl_calls.log" "$TEST_DIR/saved_prop_file"
+  rm -f "$CAPTURED_YAML" "$output_file" "$TEST_DIR/kubectl_calls.log" "$TEST_DIR/kubectl_argv.log" "$TEST_DIR/saved_prop_file"
   local rc=0
   (
     export PATH="$BIN_DIR:$PATH"
     export KUBECTL_CAPTURED_YAML="$CAPTURED_YAML"
     export KUBECTL_CALLS_LOG="$TEST_DIR/kubectl_calls.log"
+    export KUBECTL_ARGV_LOG="$TEST_DIR/kubectl_argv.log"
     export MOCK_SAVED_PROP_FILE="$TEST_DIR/saved_prop_file"
-    export MOCK_SECRET_APPLY_FORBIDDEN="0"
-    export MOCK_SECRET_APPLY_TRANSIENT="0"
-    export MOCK_CREATE_SECRET_FAIL="0"
+    export MOCK_SECRET_CREATE_FORBIDDEN="0"
+    export MOCK_SECRET_CREATE_TRANSIENT="0"
     export MOCK_POD_APPLY_FAIL="0"
     export MOCK_GET_SECRET_NOT_FOUND=""
     export POD_NAME="kaniko-test-1-1"
@@ -263,6 +257,10 @@ run_action() {
 
 get_kubectl_calls() {
   cat "$TEST_DIR/kubectl_calls.log" 2>/dev/null || true
+}
+
+get_kubectl_argv() {
+  cat "$TEST_DIR/kubectl_argv.log" 2>/dev/null || true
 }
 
 get_kaniko_resources() {
@@ -648,17 +646,144 @@ fi
 # 5. Gradle secrets tests (TD-2442)
 # ==============================================================================
 
+read -r -d '' GOLDEN_POD_YAML <<'EOF' || true
+apiVersion: v1
+kind: Pod
+metadata:
+  name: kaniko-test-1-1-a1
+  namespace: test-ns
+  labels:
+    app: kaniko-builder
+spec:
+  activeDeadlineSeconds: 7800
+  initContainers:
+  - name: merge-docker-config
+    image: busybox:1.36
+    command: ["sh", "-c"]
+    args:
+    - |
+      cp /secret-orig/.dockerconfigjson /docker-config/config.json 2>/dev/null || echo '{"auths":{}}' > /docker-config/config.json
+      tr -d '\r\n' < /docker-config/config.json > /docker-config/config.json.flat && mv /docker-config/config.json.flat /docker-config/config.json
+      if [ -n "$REGISTRY_B64" ]; then
+        sed -i -E "s|,[[:space:]]*\"$REGISTRY_SERVER\"[[:space:]]*:[[:space:]]*\{[^{}]*\}||g" /docker-config/config.json
+        sed -i -E "s|\"$REGISTRY_SERVER\"[[:space:]]*:[[:space:]]*\{[^{}]*\}[[:space:]]*,?||g" /docker-config/config.json
+        if grep -q -E '"auths"[[:space:]]*:[[:space:]]*\{[[:space:]]*\}' /docker-config/config.json; then
+          sed -i -E 's|"auths"[[:space:]]*:[[:space:]]*\{[[:space:]]*\}|"auths":{"'"$REGISTRY_SERVER"'":{"auth":"'"$REGISTRY_B64"'"}}|' /docker-config/config.json
+        elif grep -q -E '"auths"[[:space:]]*:[[:space:]]*\{' /docker-config/config.json; then
+          sed -i -E 's|"auths"[[:space:]]*:[[:space:]]*\{|"auths":{"'"$REGISTRY_SERVER"'":{"auth":"'"$REGISTRY_B64"'"},|' /docker-config/config.json
+        else
+          echo '{"auths":{"'"$REGISTRY_SERVER"'":{"auth":"'"$REGISTRY_B64"'"}}}' > /docker-config/config.json
+        fi
+        if ! grep -q "$REGISTRY_SERVER" /docker-config/config.json; then
+          echo "::error::Failed to inject registry auth for $REGISTRY_SERVER"
+          exit 1
+        fi
+      fi
+      if [ -n "$DOCKERHUB_B64" ]; then
+        DH_SRV="https://index.docker.io/v1/"
+        sed -i -E "s|,[[:space:]]*\"$DH_SRV\"[[:space:]]*:[[:space:]]*\{[^{}]*\}||g" /docker-config/config.json
+        sed -i -E "s|\"$DH_SRV\"[[:space:]]*:[[:space:]]*\{[^{}]*\}[[:space:]]*,?||g" /docker-config/config.json
+        if grep -q -E '"auths"[[:space:]]*:[[:space:]]*\{[[:space:]]*\}' /docker-config/config.json; then
+          sed -i -E 's|"auths"[[:space:]]*:[[:space:]]*\{[[:space:]]*\}|"auths":{"https://index.docker.io/v1/":{"auth":"'"$DOCKERHUB_B64"'"}}|' /docker-config/config.json
+        elif grep -q -E '"auths"[[:space:]]*:[[:space:]]*\{' /docker-config/config.json; then
+          sed -i -E 's|"auths"[[:space:]]*:[[:space:]]*\{|"auths":{"https://index.docker.io/v1/":{"auth":"'"$DOCKERHUB_B64"'"},|' /docker-config/config.json
+        else
+          echo '{"auths":{"https://index.docker.io/v1/":{"auth":"'"$DOCKERHUB_B64"'"}}}' > /docker-config/config.json
+        fi
+        if ! grep -q "https://index.docker.io/v1/" /docker-config/config.json; then
+          echo "::error::Failed to inject Docker Hub auth"
+          exit 1
+        fi
+      fi
+    env:
+    - name: DOCKERHUB_B64
+      value: ""
+    - name: REGISTRY_B64
+      value: ""
+    - name: REGISTRY_SERVER
+      value: "registry.thedevs.ru"
+    volumeMounts:
+    - name: secret-orig
+      mountPath: /secret-orig
+      readOnly: true
+    - name: docker-config
+      mountPath: /docker-config
+    resources:
+      requests:
+        memory: "32Mi"
+        cpu: "50m"
+      limits:
+        memory: "64Mi"
+        cpu: "100m"
+  containers:
+  - name: kaniko
+    image: gcr.io/kaniko-project/executor:v1.23.2
+    args:
+    - "--context=git://x-access-token:token123@github.com/test-org/test-repo.git#refs/heads/dev"
+    - "--destination=registry.thedevs.ru/test-image:test-tag"
+    - "--dockerfile=Dockerfile"
+    - "--build-arg=CACHEBUST=1-1"
+    - "--insecure"
+    - "--insecure-pull"
+    - "--cache=true"
+    - "--cache-repo=registry.thedevs.ru/test-image/cache"
+    - "--cache-ttl=168h"
+    resources:
+      requests:
+        memory: "2Gi"
+        cpu: "1000m"
+      limits:
+        memory: "8Gi"
+        cpu: "16000m"
+    volumeMounts:
+    - name: docker-config
+      mountPath: /kaniko/.docker
+    - name: shared-cache
+      mountPath: /root/.gradle/wrapper
+      subPath: gradle-wrapper
+    - name: shared-cache
+      mountPath: /root/.vaadin
+      subPath: vaadin-root-cache
+    - name: shared-cache
+      mountPath: /root/.gradle/nodejs
+      subPath: gradle-nodejs
+    - name: shared-cache
+      mountPath: /root/.npm
+      subPath: npm-cache
+    - name: project-cache
+      mountPath: /root/.gradle/caches
+  restartPolicy: Never
+  volumes:
+  - name: secret-orig
+    secret:
+      secretName: test-secret
+      optional: true
+  - name: docker-config
+    emptyDir: {}
+  - name: shared-cache
+    persistentVolumeClaim:
+      claimName: kaniko-cache
+  - name: project-cache
+    persistentVolumeClaim:
+      claimName: test-pvc
+EOF
+
 # 5.1 Security: gradle credentials not leaked to YAML, logs, or argv
 run_action INPUT_GRADLE_USERNAME="supersecretuser" INPUT_GRADLE_PASSWORD="supersecretpassword123"
 captured_content=$(cat "$CAPTURED_YAML" 2>/dev/null || true)
+argv_log=$(get_kubectl_argv)
+calls=$(get_kubectl_calls)
 if [ "$ACTION_RC" -eq 0 ] && \
    assert_not_contains "$captured_content" "supersecretuser" && \
    assert_not_contains "$captured_content" "supersecretpassword123" && \
    assert_not_contains "$ACTION_LOG" "supersecretuser" && \
-   assert_not_contains "$ACTION_LOG" "supersecretpassword123"; then
-  test_pass "5.1 Security: credentials not leaked to pod YAML or action logs"
+   assert_not_contains "$ACTION_LOG" "supersecretpassword123" && \
+   assert_not_contains "$argv_log" "supersecretuser" && \
+   assert_not_contains "$argv_log" "supersecretpassword123" && \
+   assert_not_contains "$calls" "apply secret"; then
+  test_pass "5.1 Security: credentials not leaked to pod YAML, action logs, or kubectl argv"
 else
-  test_fail "5.1 Security: credentials leaked" "RC=$ACTION_RC"
+  test_fail "5.1 Security: credentials leaked" "RC=$ACTION_RC, argv='$argv_log'"
 fi
 
 # 5.2 Properties format: verify properties file generated with correct keys and backslash escaping
@@ -680,6 +805,7 @@ captured_content=$(cat "$CAPTURED_YAML" 2>/dev/null || true)
 calls=$(get_kubectl_calls)
 if [ "$ACTION_RC" -eq 0 ] && \
    assert_contains "$calls" "create secret generic kaniko-test-1-1-a1-gradle" && \
+   assert_not_contains "$calls" "apply secret" && \
    assert_contains "$calls" "patch secret" && \
    assert_contains "$calls" "ownerReferences" && \
    assert_contains "$captured_content" "name: gradle-secret" && \
@@ -695,39 +821,42 @@ else
 fi
 
 # 5.4.1 Secret creation failure: RBAC Forbidden -> exit 1, error message, pod NOT created
-run_action INPUT_GRADLE_USERNAME="testuser" INPUT_GRADLE_PASSWORD="testpassword" MOCK_SECRET_APPLY_FORBIDDEN="1"
+run_action INPUT_GRADLE_USERNAME="testuser" INPUT_GRADLE_PASSWORD="testpassword" MOCK_SECRET_CREATE_FORBIDDEN="1"
 calls=$(get_kubectl_calls)
 if [ "$ACTION_RC" -ne 0 ] && \
    assert_contains "$ACTION_LOG" "::error::RBAC permission denied to create temporary gradle secret" && \
-   assert_contains "$ACTION_LOG" "Ensure the service account from BUILDER_CONFIG_K8S has 'create' and 'delete' verbs on 'secrets'" && \
-   assert_not_contains "$calls" "apply pod"; then
+   assert_contains "$ACTION_LOG" "Ensure the service account from BUILDER_CONFIG_K8S has 'get', 'create', 'delete', and 'patch' verbs on 'secrets'" && \
+   assert_not_contains "$calls" "apply pod" && \
+   assert_not_contains "$calls" "apply secret"; then
   test_pass "5.4.1 Secret creation error: RBAC Forbidden -> fail-fast, diagnostic error, no pod created"
 else
   test_fail "5.4.1 Secret creation error RBAC" "RC=$ACTION_RC, log='$ACTION_LOG', calls='$calls'"
 fi
 
-# 5.4.2 Secret creation failure: Transient failure -> retry with backoff, exit 1 after MAX_ATTEMPTS, no pod
-run_action INPUT_GRADLE_USERNAME="testuser" INPUT_GRADLE_PASSWORD="testpassword" MOCK_SECRET_APPLY_TRANSIENT="1"
+# 5.4.2 Secret creation failure: Transient failure -> retry with backoff, exit 1 after MAX_ATTEMPTS, eager cleanup
+run_action INPUT_GRADLE_USERNAME="testuser" INPUT_GRADLE_PASSWORD="testpassword" MOCK_SECRET_CREATE_TRANSIENT="1"
 calls=$(get_kubectl_calls)
 if [ "$ACTION_RC" -ne 0 ] && \
    assert_contains "$ACTION_LOG" "Transient failure creating gradle secret — retrying in 10s" && \
    assert_contains "$ACTION_LOG" "Transient failure creating gradle secret — retrying in 30s" && \
    assert_contains "$ACTION_LOG" "::error::Failed to create temporary gradle secret" && \
-   assert_not_contains "$calls" "apply pod"; then
-  test_pass "5.4.2 Secret creation error: Transient failure -> retries with backoff, exit 1, no pod created"
+   assert_not_contains "$calls" "apply pod" && \
+   assert_contains "$calls" "delete secret kaniko-test-1-1-a1-gradle" && \
+   assert_contains "$calls" "delete secret kaniko-test-1-1-a2-gradle" && \
+   assert_contains "$calls" "delete secret kaniko-test-1-1-a3-gradle"; then
+  test_pass "5.4.2 Secret creation error: Transient failure -> retries with backoff, eager cleanup registration, exit 1, no pod created"
 else
-  test_fail "5.4.2 Secret creation error transient" "RC=$ACTION_RC, log='$ACTION_LOG'"
+  test_fail "5.4.2 Secret creation error transient" "RC=$ACTION_RC, log='$ACTION_LOG', calls='$calls'"
 fi
 
-# 5.4.3 Secret creation failure: pipefail catches failure in dry-run create (stage 1 of pipe)
-run_action INPUT_GRADLE_USERNAME="testuser" INPUT_GRADLE_PASSWORD="testpassword" MOCK_CREATE_SECRET_FAIL="1"
+# 5.4.3 Immediate delete secret invocation on failed create attempt
+run_action INPUT_GRADLE_USERNAME="testuser" INPUT_GRADLE_PASSWORD="testpassword" MOCK_SECRET_CREATE_TRANSIENT="1"
 calls=$(get_kubectl_calls)
 if [ "$ACTION_RC" -ne 0 ] && \
-   assert_contains "$ACTION_LOG" "::error::Failed to create temporary gradle secret" && \
-   assert_not_contains "$calls" "apply pod"; then
-  test_pass "5.4.3 Secret creation error: pipefail catches dry-run create failure, no pod created"
+   assert_contains "$calls" "delete secret kaniko-test-1-1-a1-gradle"; then
+  test_pass "5.4.3 Immediate delete secret invocation on failed create attempt"
 else
-  test_fail "5.4.3 Secret creation error pipefail" "RC=$ACTION_RC, log='$ACTION_LOG'"
+  test_fail "5.4.3 Immediate delete secret" "RC=$ACTION_RC, calls='$calls'"
 fi
 
 # 5.5.1 Cleanup: delete secret on pod apply failure
@@ -752,21 +881,20 @@ else
   test_fail "5.5.2 Cleanup via trap" "RC=$ACTION_RC, calls='$calls'"
 fi
 
-# 5.6 Isolation: default run without gradle_* parameters produces byte-for-byte identical manifest
+# 5.6 Isolation: default run without gradle_* parameters produces byte-for-byte identical manifest matching golden baseline
 run_action
-baseline_yaml=$(cat "$CAPTURED_YAML")
-run_action INPUT_GRADLE_SECRET="" INPUT_GRADLE_USERNAME="" INPUT_GRADLE_PASSWORD=""
-with_empty_yaml=$(cat "$CAPTURED_YAML")
+actual_yaml=$(cat "$CAPTURED_YAML" 2>/dev/null || true)
 calls=$(get_kubectl_calls)
+diff_out=$(diff -u <(echo "$GOLDEN_POD_YAML") <(echo "$actual_yaml") || true)
 if [ "$ACTION_RC" -eq 0 ] && \
-   [ "$baseline_yaml" = "$with_empty_yaml" ] && \
-   assert_not_contains "$with_empty_yaml" "gradle-secret" && \
-   assert_not_contains "$with_empty_yaml" "gradle.properties" && \
+   [ -z "$diff_out" ] && \
+   assert_not_contains "$actual_yaml" "gradle-secret" && \
+   assert_not_contains "$actual_yaml" "gradle.properties" && \
    assert_not_contains "$calls" "create secret" && \
    assert_not_contains "$calls" "delete secret"; then
-  test_pass "5.6 Isolation: default run produces byte-for-byte identical YAML without gradle secrets"
+  test_pass "5.6 Isolation: default run produces byte-for-byte identical YAML matching golden baseline without gradle secrets"
 else
-  test_fail "5.6 Isolation" "RC=$ACTION_RC, diff: $(diff -u <(echo "$baseline_yaml") <(echo "$with_empty_yaml") || true)"
+  test_fail "5.6 Isolation" "RC=$ACTION_RC, diff: $diff_out"
 fi
 
 # 5.7.1 Validation: only username without password -> error
@@ -805,6 +933,34 @@ else
   test_fail "5.7.4 Validation: CR in password" "RC=$ACTION_RC, log='$ACTION_LOG'"
 fi
 
+# 5.7.5 Validation: leading whitespace in username or password -> error
+run_action INPUT_GRADLE_USERNAME=" user" INPUT_GRADLE_PASSWORD="password"
+res1_rc=$ACTION_RC
+res1_log=$ACTION_LOG
+run_action INPUT_GRADLE_USERNAME="user" INPUT_GRADLE_PASSWORD=" password"
+res2_rc=$ACTION_RC
+res2_log=$ACTION_LOG
+if [ "$res1_rc" -ne 0 ] && assert_contains "$res1_log" "::error::gradle_username and gradle_password must not contain leading whitespace." && \
+   [ "$res2_rc" -ne 0 ] && assert_contains "$res2_log" "::error::gradle_username and gradle_password must not contain leading whitespace."; then
+  test_pass "5.7.5 Validation: leading whitespace in username or password rejected"
+else
+  test_fail "5.7.5 Validation: leading whitespace" "RC1=$res1_rc, RC2=$res2_rc"
+fi
+
+# 5.7.6 Validation: non-printable or non-ASCII characters in username or password -> error
+run_action INPUT_GRADLE_USERNAME="юзер" INPUT_GRADLE_PASSWORD="password"
+res1_rc=$ACTION_RC
+res1_log=$ACTION_LOG
+run_action INPUT_GRADLE_USERNAME="user" INPUT_GRADLE_PASSWORD="пароль"
+res2_rc=$ACTION_RC
+res2_log=$ACTION_LOG
+if [ "$res1_rc" -ne 0 ] && assert_contains "$res1_log" "::error::gradle_username and gradle_password must contain only printable ASCII characters." && \
+   [ "$res2_rc" -ne 0 ] && assert_contains "$res2_log" "::error::gradle_username and gradle_password must contain only printable ASCII characters."; then
+  test_pass "5.7.6 Validation: non-ASCII characters in username or password rejected"
+else
+  test_fail "5.7.6 Validation: non-ASCII characters" "RC1=$res1_rc, RC2=$res2_rc"
+fi
+
 # 5.8.1 Fail-Fast: missing gradle_secret -> exit 1, error message, no pod created
 run_action INPUT_GRADLE_SECRET="missing-secret" MOCK_GET_SECRET_NOT_FOUND="missing-secret"
 calls=$(get_kubectl_calls)
@@ -829,6 +985,20 @@ if [ "$ACTION_RC" -eq 0 ] && \
   test_pass "5.8.2 Pre-existing gradle_secret mounted directly without temporary secret creation"
 else
   test_fail "5.8.2 Pre-existing gradle_secret mount" "RC=$ACTION_RC, yaml='$captured_content'"
+fi
+
+# 5.8.3 Precedence: credentials take precedence over gradle_secret with warning
+run_action INPUT_GRADLE_SECRET="pre-existing-secret" INPUT_GRADLE_USERNAME="testuser" INPUT_GRADLE_PASSWORD="testpassword"
+captured_content=$(cat "$CAPTURED_YAML" 2>/dev/null || true)
+calls=$(get_kubectl_calls)
+if [ "$ACTION_RC" -eq 0 ] && \
+   assert_contains "$ACTION_LOG" "::warning::Both gradle credentials (gradle_username/gradle_password) and gradle_secret provided. Ephemeral secret from credentials takes precedence; gradle_secret 'pre-existing-secret' is ignored." && \
+   assert_contains "$captured_content" "secretName: kaniko-test-1-1-a1-gradle" && \
+   assert_not_contains "$captured_content" "pre-existing-secret" && \
+   assert_contains "$calls" "create secret generic kaniko-test-1-1-a1-gradle"; then
+  test_pass "5.8.3 Precedence: credentials take precedence over gradle_secret with warning"
+else
+  test_fail "5.8.3 Precedence" "RC=$ACTION_RC, log='$ACTION_LOG', yaml='$captured_content'"
 fi
 
 # ==============================================================================

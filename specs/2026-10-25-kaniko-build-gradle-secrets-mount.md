@@ -139,16 +139,19 @@ EOF
    )
    chmod 600 "$GRADLE_PROP_FILE"
 
-   # Выполнение в подоболочке с set -o pipefail для корректного перехвата ошибок любой команды пайпа
-   APPLY_SECRET_OUT=$( (set -o pipefail; kubectl -n "$NS" create secret generic "$GRADLE_SECRET_NAME" \
+   # Прямой вызов kubectl create без apply, чтобы избежать сохранения кредов в аннотации last-applied-configuration
+   APPLY_SECRET_OUT=$(kubectl -n "$NS" create secret generic "$GRADLE_SECRET_NAME" \
      --from-file="gradle.properties=$GRADLE_PROP_FILE" \
-     --dry-run=client -o yaml | kubectl apply --request-timeout=30s -f -) 2>&1 )
+     --request-timeout=30s 2>&1)
    APPLY_SECRET_RC=$?
    rm -f "$GRADLE_PROP_FILE"
 
+   CREATED_GRADLE_SECRETS+=("$GRADLE_SECRET_NAME")
+
    if [ "$APPLY_SECRET_RC" -ne 0 ]; then
+     kubectl -n "$NS" delete secret "$GRADLE_SECRET_NAME" --ignore-not-found --wait=false --request-timeout=30s >/dev/null 2>&1 || true
      if printf '%s' "$APPLY_SECRET_OUT" | grep -F -q 'Forbidden'; then
-       echo "::error::RBAC permission denied to create temporary gradle secret '$GRADLE_SECRET_NAME' in namespace '$NS'. Ensure the service account from BUILDER_CONFIG_K8S has 'create' and 'delete' verbs on 'secrets'. Details: $(printf '%s' "$APPLY_SECRET_OUT" | tr '\n' ' ' | cut -c1-200)"
+       echo "::error::RBAC permission denied to create temporary gradle secret '$GRADLE_SECRET_NAME' in namespace '$NS'. Ensure the service account from BUILDER_CONFIG_K8S has 'get', 'create', 'delete', and 'patch' verbs on 'secrets'. Details: $(printf '%s' "$APPLY_SECRET_OUT" | tr '\n' ' ' | cut -c1-200)"
        exit 1
      fi
      if [ "$ATTEMPT" -lt "$MAX_ATTEMPTS" ]; then
@@ -162,8 +165,6 @@ EOF
      echo "::error::Failed to create temporary gradle secret '$GRADLE_SECRET_NAME' in namespace '$NS': $(printf '%s' "$APPLY_SECRET_OUT" | tr '\n' ' ' | cut -c1-200)"
      exit 1
    fi
-
-   CREATED_GRADLE_SECRETS+=("$GRADLE_SECRET_NAME")
    ```
 
 2. **Защита от осиротевших секретов при аварийном завершении раннера (ownerReferences):**
@@ -331,13 +332,13 @@ EOF
    - При передаче `gradle_secret` выполняется pre-flight проверка: `NotFound` вызывает ошибку `::error::` и код 1.
    - При отсутствии параметров `gradle_*` манифест пода сохраняет текущую структуру без изменений.
 3. Временный секрет `${POD}-gradle` создается без передачи секретов в `argv` через `--from-file` из временного файла с `chmod 600` и экранированием `\` как `\\`, а временный файл немедленно удаляется.
-4. Ошибка создания секрета проверяется через `$?` в подоболочке с `set -o pipefail`: при ответе `Forbidden` шаг немедленно падает с диагностикой нехватки прав RBAC, при транзиентных ошибках выполняется повтор с backoff, при исчерпании попыток шаг завершается с `::error::`, а под Kaniko не создается.
+4. Ошибка создания секрета проверяется через прямой вызов `kubectl create` и захват `$?`: при ответе `Forbidden` шаг немедленно падает с диагностикой нехватки прав RBAC, при транзиентных ошибках выполняется повтор с backoff, при исчерпании попыток шаг завершается с `::error::`, а под Kaniko не создается.
 5. На созданный временный секрет проставляется `ownerReferences` на созданный под Kaniko, что гарантирует удаление секрета Garbage Collector-ом Kubernetes даже при аварийном завершении раннера (`SIGKILL`).
 6. Временные секреты всех попыток сборки из массива `CREATED_GRADLE_SECRETS` гарантированно удаляются через обработчик `trap cleanup_gradle_secrets EXIT INT TERM`, а также при завершении или ошибке пода.
 7. Значения `gradle_username` и `gradle_password` не отображаются в логах экшена и отсутствуют в манифесте pod YAML.
 8. В манифесте пода секрет монтируется напрямую в контейнер `kaniko` как том `secret` с `defaultMode: 0400` и `volumeMount` в `/root/.gradle/gradle.properties` (`subPath: gradle.properties`, `readOnly: true`). Никаких init-контейнеров и томов `emptyDir` не создается.
 9. Документация в `actions/kaniko-build/README.md` актуализирована с описанием новых параметров и требований к RBAC.
-10. Тесты в `tests/test-kaniko-build.sh` дополнены проверками всех сценариев (парность, переносы строк, ошибка RBAC при создании секрета, транзиентные ошибки пайпа с `set -o pipefail`, fail-fast, создание и удаление секрета, отсутствие паролей в YAML и stdout/stderr).
+10. Тесты в `tests/test-kaniko-build.sh` дополнены проверками всех сценариев (парность, переносы строк, ошибка RBAC при создании секрета, транзиентные ошибки create, fail-fast, создание и удаление секрета, отсутствие паролей в YAML, argv и stdout/stderr).
 11. Спецификация проходит валидацию `bash references/contracts/builder/tools/validate-spec-format.sh specs/2026-10-25-kaniko-build-gradle-secrets-mount.md` с кодом 0.
 
 # Не трогать
