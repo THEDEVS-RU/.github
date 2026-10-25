@@ -117,8 +117,9 @@ impl_effort: high
 
 Создание временного секрета выполняется строго через временный файл на раннере и пайп в `kubectl apply`, исключая попадание пароля в `argv` (`ps aux`) и метаданные пода:
 
-1. **Создание секрета и экранирование спецсимволов Java Properties:**
-   В цикле попыток сборки перед запуском пода при `USE_TEMP_GRADLE_SECRET=1`:
+1. **Создание секрета и надежная проверка кода возврата через pipefail:**
+   Перед циклом попыток инициализируется список созданных секретов: `CREATED_GRADLE_SECRETS=()`.
+   Внутри цикла попыток сборки перед запуском пода при `USE_TEMP_GRADLE_SECRET=1`:
    ```bash
    GRADLE_SECRET_NAME="${POD}-gradle"
    GRADLE_PROP_FILE="${RUNNER_TEMP:-/tmp}/${POD}-gradle.properties"
@@ -138,10 +139,11 @@ EOF
    )
    chmod 600 "$GRADLE_PROP_FILE"
 
-   APPLY_SECRET_OUT=$(kubectl -n "$NS" create secret generic "$GRADLE_SECRET_NAME" \
+   # Выполнение в подоболочке с set -o pipefail для корректного перехвата ошибок любой команды пайпа
+   APPLY_SECRET_OUT=$( (set -o pipefail; kubectl -n "$NS" create secret generic "$GRADLE_SECRET_NAME" \
      --from-file="gradle.properties=$GRADLE_PROP_FILE" \
-     --dry-run=client -o yaml | kubectl apply --request-timeout=30s -f - 2>&1)
-   APPLY_SECRET_RC=${PIPESTATUS[1]}
+     --dry-run=client -o yaml | kubectl apply --request-timeout=30s -f -) 2>&1 )
+   APPLY_SECRET_RC=$?
    rm -f "$GRADLE_PROP_FILE"
 
    if [ "$APPLY_SECRET_RC" -ne 0 ]; then
@@ -160,29 +162,44 @@ EOF
      echo "::error::Failed to create temporary gradle secret '$GRADLE_SECRET_NAME' in namespace '$NS': $(printf '%s' "$APPLY_SECRET_OUT" | tr '\n' ' ' | cut -c1-200)"
      exit 1
    fi
+
+   CREATED_GRADLE_SECRETS+=("$GRADLE_SECRET_NAME")
    ```
 
 2. **Защита от осиротевших секретов при аварийном завершении раннера (ownerReferences):**
-   После создания пода Kaniko (`kubectl apply -f -`) из метаданных пода извлекается его UID, и на временный секрет проставляется ссылка владельца (`ownerReferences`):
+   После успешного применения манифеста пода Kaniko (`kubectl apply -f -`) из метаданных пода извлекается его UID, и на временный секрет проставляется ссылка владельца (`ownerReferences`):
    ```bash
    POD_UID=$(kubectl -n "$NS" get pod "$POD" -o jsonpath='{.metadata.uid}' --request-timeout=15s 2>/dev/null || true)
    if [ -n "$POD_UID" ]; then
-     kubectl -n "$NS" patch secret "$GRADLE_SECRET_NAME" --type=merge --request-timeout=15s \
-       -p "{\"metadata\":{\"ownerReferences\":[{\"apiVersion\":\"v1\",\"kind\":\"Pod\",\"name\":\"$POD\",\"uid\":\"$POD_UID\",\"blockOwnerDeletion\":false}]}}" >/dev/null 2>&1 || true
+     PATCH_ERR=$(kubectl -n "$NS" patch secret "$GRADLE_SECRET_NAME" --type=merge --request-timeout=15s \
+       -p "{\"metadata\":{\"ownerReferences\":[{\"apiVersion\":\"v1\",\"kind\":\"Pod\",\"name\":\"$POD\",\"uid\":\"$POD_UID\",\"blockOwnerDeletion\":false}]}}" 2>&1 >/dev/null || true)
+     if [ -n "$PATCH_ERR" ]; then
+       echo "::warning::Failed to set ownerReferences on secret '$GRADLE_SECRET_NAME': $PATCH_ERR"
+     fi
+   else
+     echo "::warning::Could not obtain UID of pod '$POD' to set ownerReferences on secret '$GRADLE_SECRET_NAME'"
    fi
    ```
    Благодаря этому, если процесс раннера будет аварийно убит по `SIGKILL` (runner lost), Kubernetes Garbage Collector автоматически удалит Secret вместе с завершенным/удаленным подом.
 
-3. **Гарантированная очистка (Cleanup via trap EXIT):**
-   В начале скрипта регистрируется обработчик `trap cleanup_gradle_secrets EXIT INT TERM`:
+3. **Гарантированная очистка (Cleanup via trap EXIT и удаление при сбоях попыток):**
+   В начале скрипта регистрируется обработчик `trap cleanup_gradle_secrets EXIT INT TERM`, который удаляет все созданные временные секреты из массива `CREATED_GRADLE_SECRETS`:
    ```bash
    cleanup_gradle_secrets() {
      [ -n "${GRADLE_PROP_FILE:-}" ] && rm -f "$GRADLE_PROP_FILE" 2>/dev/null || true
-     if [ "$USE_TEMP_GRADLE_SECRET" -eq 1 ] && [ -n "${GRADLE_SECRET_NAME:-}" ]; then
-       kubectl -n "$NS" delete secret "$GRADLE_SECRET_NAME" --ignore-not-found --wait=false --request-timeout=30s >/dev/null 2>&1 || true
+     if [ "$USE_TEMP_GRADLE_SECRET" -eq 1 ]; then
+       for s in "${CREATED_GRADLE_SECRETS[@]}"; do
+         [ -n "$s" ] && kubectl -n "$NS" delete secret "$s" --ignore-not-found --wait=false --request-timeout=30s >/dev/null 2>&1 || true
+       done
      fi
    }
    trap cleanup_gradle_secrets EXIT INT TERM
+   ```
+   При падении `kubectl apply` для пода (`APPLY_RC -ne 0`) секрет текущей попытки удаляется немедленно перед переходом на следующую попытку (`continue`):
+   ```bash
+   if [ "$USE_TEMP_GRADLE_SECRET" -eq 1 ]; then
+     kubectl -n "$NS" delete secret "$GRADLE_SECRET_NAME" --ignore-not-found --wait=false --request-timeout=30s >/dev/null 2>&1 || true
+   fi
    ```
    Удаление локального файла производится строго по точной переменной пути `GRADLE_PROP_FILE`, без использования опасных масок по каталогу `/tmp`.
 
@@ -221,7 +238,7 @@ EOF
 ### Анализ пограничных случаев монтирования subPath:
 В Kubernetes монтирование `subPath` файла из секрета с явным списком `items` имеет особенность: если секрет или указанный ключ `gradle.properties` физически отсутствует в namespace, Kubelet не может создать проекцию и под зависает в статусе `ContainerCreating` с событием `FailedMount`.
 Данный риск полностью предотвращен предложенной архитектурой:
-- Для временного секрета `${POD}-gradle` создание проверяется через `PIPESTATUS` до создания пода, а сам ключ `gradle.properties` формируется экшеном гарантированно;
+- Для временного секрета `${POD}-gradle` успешность создания проверяется через `$?` в подоболочке с `set -o pipefail` до создания пода, а сам ключ `gradle.properties` формируется экшеном гарантированно;
 - Для постоянного секрета `gradle_secret` pre-flight проверка Fail-Fast завершает шаг ошибкой еще до создания пода, исключая зависание;
 - При `GRADLE_SECRET_NAME=""` секции `volumeMounts` и `volumes` для `gradle-secret` не генерируются вовсе.
 
@@ -230,7 +247,7 @@ EOF
 Обновить `actions/kaniko-build/README.md`:
 - Добавить параметры `gradle_secret`, `gradle_username`, `gradle_password` в таблицу `inputs`;
 - Задокументировать требования к RBAC сервис-аккаунта (`get`, `create`, `delete`, `patch` на `secrets`);
-- Описать схему работы: создание временного K8s-секрета из `gradle_username` и `gradle_password`, привязка `ownerReferences` к поду, прямое монтирование в `/root/.gradle/gradle.properties` с `readOnly: true`, гарантированное удаление по `trap EXIT`;
+- Описать схему работы: создание временного K8s-секрета из `gradle_username` и `gradle_password`, привязка `ownerReferences` к поду, прямое монтирование в `/root/.gradle/gradle.properties` с `readOnly: true`, гарантированное удаление по `trap EXIT` и массиву созданных секретов;
 - Привести пример использования с GitHub Secrets:
   ```yaml
   - name: Build container image
@@ -251,8 +268,13 @@ EOF
 1. **Mock kubectl:** дополнить заглушку `kubectl` поддержкой команд `create secret generic`, `delete secret`, `patch secret`, проверкой флага `--from-file` и эмуляцией ошибки `Forbidden`.
 2. **Негативный тест безопасности:** проверить, что тестовые значения `INPUT_GRADLE_USERNAME="testuser"` и `INPUT_GRADLE_PASSWORD="testpassword123"` не встречаются ни в захваченном манифесте pod YAML (`CAPTURED_YAML`), ни в логах stdout/stderr экшена.
 3. **Тест создания и монтирования временного секрета:** при передаче `gradle_username` и `gradle_password` проверить, что генерируется манифест пода с томом `kaniko-test-1-1-a1-gradle`, `defaultMode: 0400`, `items: [{key: gradle.properties, path: gradle.properties}]` и `volumeMount` в `/root/.gradle/gradle.properties`.
-4. **Тест обработки ошибки RBAC:** смоделировать ответ `Forbidden` от `kubectl apply` при создании секрета, проверить, что шаг падает с понятной ошибкой RBAC, и создание пода не инициируется.
-5. **Тест удаления временного секрета:** проверить, что при нормальном завершении и при ошибке сборщика mock kubectl регистрирует вызов удаления `delete secret kaniko-test-1-1-a1-gradle`.
+4. **Тест обработки ошибок создания секрета:**
+   - Моделирование ответа `Forbidden` при `kubectl apply` для секрета: проверить немедленный выход с кодом 1, вывод ошибки RBAC и отсутствие вызова создания пода;
+   - Моделирование транзиентной ошибки `kubectl apply` для секрета (сеть, таймаут): проверить повтор с backoff и итоговый `exit 1` после `MAX_ATTEMPTS` без вызова apply пода;
+   - Моделирование отказа на этапе `create --dry-run` (первая команда пайпа): проверить перехват через `set -o pipefail` и немедленный `exit 1`.
+5. **Тест удаления временных секретов:**
+   - Проверить, что при падении `apply` пода секрет текущей попытки удаляется через `delete secret`;
+   - Проверить, что при завершении работы экшена (успех или ошибка) вызывается удаление всех созданных временных секретов из `CREATED_GRADLE_SECRETS`.
 6. **Тест изоляции (побайтное совпадение по умолчанию):** без параметров `gradle_*` сгенерированный pod YAML побайтно совпадает с эталонным манифестом (без лишних томов).
 7. **Тест валидации парности и переносов строк:** проверить, что указание только `gradle_username` без `gradle_password`, либо передача значения с переводом строки немедленно возвращает код 1 с ошибкой `::error::`.
 8. **Тест Fail-Fast для `gradle_secret`:** при передаче несуществующего секрета шаг завершается с ошибкой `::error::Gradle secret '...' specified but not found`.
@@ -309,13 +331,13 @@ EOF
    - При передаче `gradle_secret` выполняется pre-flight проверка: `NotFound` вызывает ошибку `::error::` и код 1.
    - При отсутствии параметров `gradle_*` манифест пода сохраняет текущую структуру без изменений.
 3. Временный секрет `${POD}-gradle` создается без передачи секретов в `argv` через `--from-file` из временного файла с `chmod 600` и экранированием `\` как `\\`, а временный файл немедленно удаляется.
-4. Ошибка создания секрета проверяется по `PIPESTATUS[1]`: при ответе `Forbidden` шаг немедленно падает с диагностикой нехватки прав RBAC, при транзиентных ошибках выполняется повтор с backoff, при исчерпании попыток шаг завершается с `::error::`, а под Kaniko не создается.
+4. Ошибка создания секрета проверяется через `$?` в подоболочке с `set -o pipefail`: при ответе `Forbidden` шаг немедленно падает с диагностикой нехватки прав RBAC, при транзиентных ошибках выполняется повтор с backoff, при исчерпании попыток шаг завершается с `::error::`, а под Kaniko не создается.
 5. На созданный временный секрет проставляется `ownerReferences` на созданный под Kaniko, что гарантирует удаление секрета Garbage Collector-ом Kubernetes даже при аварийном завершении раннера (`SIGKILL`).
-6. Временный секрет `${POD}-gradle` удаляется через обработчик `trap cleanup_gradle_secrets EXIT INT TERM` по точному пути файла и имени секрета.
+6. Временные секреты всех попыток сборки из массива `CREATED_GRADLE_SECRETS` гарантированно удаляются через обработчик `trap cleanup_gradle_secrets EXIT INT TERM`, а также при завершении или ошибке пода.
 7. Значения `gradle_username` и `gradle_password` не отображаются в логах экшена и отсутствуют в манифесте pod YAML.
 8. В манифесте пода секрет монтируется напрямую в контейнер `kaniko` как том `secret` с `defaultMode: 0400` и `volumeMount` в `/root/.gradle/gradle.properties` (`subPath: gradle.properties`, `readOnly: true`). Никаких init-контейнеров и томов `emptyDir` не создается.
 9. Документация в `actions/kaniko-build/README.md` актуализирована с описанием новых параметров и требований к RBAC.
-10. Тесты в `tests/test-kaniko-build.sh` дополнены проверками всех сценариев (парность, переносы строк, ошибка RBAC при создании секрета, fail-fast, создание и удаление секрета, отсутствие паролей в YAML и stdout/stderr).
+10. Тесты в `tests/test-kaniko-build.sh` дополнены проверками всех сценариев (парность, переносы строк, ошибка RBAC при создании секрета, транзиентные ошибки пайпа с `set -o pipefail`, fail-fast, создание и удаление секрета, отсутствие паролей в YAML и stdout/stderr).
 11. Спецификация проходит валидацию `bash references/contracts/builder/tools/validate-spec-format.sh specs/2026-10-25-kaniko-build-gradle-secrets-mount.md` с кодом 0.
 
 # Не трогать
