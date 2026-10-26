@@ -63,7 +63,7 @@ impl_effort: high
          testAddon.dependsOn(filterHostStarterResources)
      }
      ```
-   - Заменить `p.sourceSets.main.output` и `starterMainOutput` в формировании `testAddon.classpath` на `classesDirs` и отфильтрованные каталоги ресурсов:
+   - Заменить `p.sourceSets.main.output` и `starterMainOutput` в формировании `testAddon.classpath` на `classesDirs`, `output.dirs` (сохраняя каталоги, зарегистрированные через `sourceSets.main.output.dir(...)`, такие как Jmix `orm.xml` / `persistence.xml`) и отфильтрованные каталоги ресурсов:
      ```groovy
      def hostResourcesDirs = [mainResDir] + (starterResDir != null ? [starterResDir] : [])
      testAddon.classpath = p.files({
@@ -73,7 +73,9 @@ impl_effort: high
          return p.files(classesDir, aggregateFile.parentFile, hostResourcesDirs) +
                 addonTestClasspath +
                 p.sourceSets.main.output.classesDirs +
+                p.sourceSets.main.output.dirs +
                 starterClassesDirs +
+                starterOutputDirs +
                 runtimeClasspath
      })
      ```
@@ -130,7 +132,7 @@ impl_effort: high
 # Критерии готовности
 
 1. В `actions/setup-addon-tests/ci-addon-tests.init.gradle` зарегистрированы изолированные `Sync`-задачи `filterHostMainResources_${baseModule}` и `filterHostStarterResources_${baseModule}`, исключающие дескриптор `META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports` из ресурсов хоста (`p` и `starterProject`) в каталоги `host-resources/main` и `host-resources/starter`.
-2. В `testAddon.classpath` подключаются `p.sourceSets.main.output.classesDirs`, `starterClassesDirs` и отфильтрованные каталоги ресурсов вместо прямых `p.sourceSets.main.output` и `starterMainOutput`. Системное свойство `spring.autoconfigure.exclude` не выставляется принудительно и не затирает свойства зависимости.
+2. В `testAddon.classpath` подключаются `p.sourceSets.main.output.classesDirs`, `p.sourceSets.main.output.dirs`, `starterClassesDirs`, `starterOutputDirs` и отфильтрованные каталоги ресурсов вместо прямых `p.sourceSets.main.output` и `starterMainOutput`. Системное свойство `spring.autoconfigure.exclude` не выставляется принудительно и не затирает свойства зависимости.
 3. В `tests/test-setup-addon-tests.sh` реализована сквозная верификация: (а) отсутствие дескрипторов автоконфигурации хоста (`main` и `starter`) при сохранении дескриптора зависимости через `ClassLoader.getResources`; (б) доступность классов хоста через `Class.forName`; (в) сохранение собственных исключений зависимости (`CustomExcludedAutoConfiguration`) через `assertEquals`.
 4. Спецификация валидируется `validate-spec-format.sh` с кодом 0.
 5. Верификация после доставки в `dev`: перезапуск CI на PR THEDEVS-RU/addon-tinkoff#11 подтверждает успешный статус задачи `:tinkoff:testAddon_balance` без изменений в продуктовом коде `addon-tinkoff`, а также отсутствие регрессий тестов зависимостей в других аддонах (`addon-1c`, `addon-uniteller`, `addon-balance`).
