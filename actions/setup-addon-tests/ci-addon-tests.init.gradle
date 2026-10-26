@@ -11,6 +11,7 @@ import org.gradle.api.attributes.Category
 import org.gradle.api.publish.PublishingExtension
 import org.gradle.api.publish.maven.MavenPublication
 import org.gradle.api.publish.tasks.GenerateModuleMetadata
+import org.gradle.api.tasks.Sync
 import org.gradle.api.tasks.bundling.Jar
 import org.gradle.api.tasks.testing.Test
 
@@ -602,17 +603,35 @@ gradle.projectsEvaluated {
                 }
             } ?: p.rootProject.subprojects.find { it.name == "${p.name}-starter" } ?:
                  p.rootProject.subprojects.find { it.name.endsWith('-starter') }
-            def starterMainOutput = (starterProject != null && starterProject.pluginManager.hasPlugin('java')) ?
-                starterProject.sourceSets.main.output : p.files()
+            def starterClassesDirs = (starterProject != null && starterProject.pluginManager.hasPlugin('java')) ?
+                starterProject.sourceSets.main.output.classesDirs : p.files()
 
+            def mainResDir = p.layout.buildDirectory.dir("addon-tests/${baseModule}/host-resources/main")
+            def filterHostMainResources = p.tasks.maybeCreate("filterHostMainResources_${baseModule}", Sync)
+            filterHostMainResources.destinationDir = mainResDir.get().asFile
+            filterHostMainResources.from(p.tasks.named('processResources'))
+            filterHostMainResources.exclude 'META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports'
+            testAddon.dependsOn(filterHostMainResources)
+
+            def starterResDir = (starterProject != null && starterProject.pluginManager.hasPlugin('java')) ?
+                p.layout.buildDirectory.dir("addon-tests/${baseModule}/host-resources/starter") : null
+            if (starterResDir != null) {
+                def filterHostStarterResources = p.tasks.maybeCreate("filterHostStarterResources_${baseModule}", Sync)
+                filterHostStarterResources.destinationDir = starterResDir.get().asFile
+                filterHostStarterResources.from(starterProject.tasks.named('processResources'))
+                filterHostStarterResources.exclude 'META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports'
+                testAddon.dependsOn(filterHostStarterResources)
+            }
+
+            def hostResourcesDirs = [mainResDir] + (starterResDir != null ? [starterResDir] : [])
             testAddon.classpath = p.files({
                 if (testState.skippedPreRollout || testState.testsDisabled) {
                     return p.files()
                 }
-                return p.files(classesDir, aggregateFile.parentFile) +
+                return p.files(classesDir, aggregateFile.parentFile, hostResourcesDirs) +
                        addonTestClasspath +
-                       p.sourceSets.main.output +
-                       starterMainOutput +
+                       p.sourceSets.main.output.classesDirs +
+                       starterClassesDirs +
                        runtimeClasspath
             })
 
