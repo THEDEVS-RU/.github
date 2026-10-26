@@ -49,17 +49,38 @@ public class ItinkService {
 }
 EOF
 
+cat > "$UPSTREAM_DIR/itink-mod/src/main/java/ru/thedevs/itink/ItinkAutoConfiguration.java" <<'EOF'
+package ru.thedevs.itink;
+public class ItinkAutoConfiguration {
+}
+EOF
+
+mkdir -p "$UPSTREAM_DIR/itink-mod/src/main/resources/META-INF/spring"
+cat > "$UPSTREAM_DIR/itink-mod/src/main/resources/META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports" <<'EOF'
+ru.thedevs.itink.ItinkAutoConfiguration
+EOF
+
 mkdir -p "$UPSTREAM_DIR/itink-mod/src/test/java/ru/thedevs/itink"
 cat > "$UPSTREAM_DIR/itink-mod/src/test/java/ru/thedevs/itink/ItinkTest.java" <<'EOF'
 package ru.thedevs.itink;
+
 import org.junit.jupiter.api.Test;
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.net.URL;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.Enumeration;
+import java.util.List;
+
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class ItinkTest {
     @Test
-    void testItinkService() {
+    void testItinkService() throws Exception {
         assertEquals("hello from itink", new ItinkService().message());
         String changelog = System.getProperty("main.liquibase.change-log");
         assertNotNull(changelog, "main.liquibase.change-log must be set");
@@ -69,6 +90,42 @@ public class ItinkTest {
             while (res.startsWith("/")) res = res.substring(1);
             assertNotNull(getClass().getClassLoader().getResource(res), "Changelog resource must be resolvable via ClassLoader: " + res);
         }
+        assertNotNull(getClass().getClassLoader().getResource("ru/thedevs/consumer/liquibase/changelog.xml"),
+                "Host changelog must be resolvable via ClassLoader from host-resources");
+
+        // (a) Verify host autoconfiguration imports descriptors are excluded, while dependency descriptor is present
+        Enumeration<URL> importsUrls = getClass().getClassLoader().getResources(
+                "META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports");
+        List<String> importsEntries = new ArrayList<>();
+        while (importsUrls.hasMoreElements()) {
+            URL url = importsUrls.nextElement();
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(url.openStream(), StandardCharsets.UTF_8))) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    line = line.trim();
+                    if (!line.isEmpty() && !line.startsWith("#")) {
+                        importsEntries.add(line);
+                    }
+                }
+            }
+        }
+        assertTrue(importsEntries.contains("ru.thedevs.itink.ItinkAutoConfiguration"),
+                "Dependency autoconfiguration must be present on classpath: " + importsEntries);
+        assertFalse(importsEntries.contains("ru.thedevs.consumer.ConsumerMainAutoConfiguration"),
+                "Host main autoconfiguration descriptor must be excluded from classpath: " + importsEntries);
+        assertFalse(importsEntries.contains("ru.thedevs.consumer.starter.ConsumerAutoConfiguration"),
+                "Host starter autoconfiguration descriptor must be excluded from classpath: " + importsEntries);
+
+        // (б) Verify host classes are preserved and loadable from classpath
+        assertNotNull(Class.forName("ru.thedevs.consumer.starter.ConsumerAutoConfiguration"),
+                "Host starter class must be loadable");
+        assertNotNull(Class.forName("ru.thedevs.consumer.ConsumerService"),
+                "Host main class must be loadable");
+
+        // (в) Verify dependency test system properties are preserved without being overwritten by harness
+        assertEquals("ru.thedevs.itink.CustomExcludedAutoConfiguration",
+                System.getProperty("spring.autoconfigure.exclude"),
+                "Dependency spring.autoconfigure.exclude system property must be preserved");
     }
 }
 EOF
@@ -93,6 +150,9 @@ dependencies {
     testImplementation(dependencies.create(project(':helper-test')) {
         exclude group: 'org.slf4j', module: 'slf4j-api'
     })
+}
+test {
+    systemProperty 'spring.autoconfigure.exclude', 'ru.thedevs.itink.CustomExcludedAutoConfiguration'
 }
 publishing {
     publications {
@@ -285,6 +345,11 @@ if ! echo "$TEST_PROPS" | grep -q "thedevs.test.liquibase.change-log=ru/thedevs/
   exit 1
 fi
 
+if ! echo "$TEST_PROPS" | grep -q "thedevs.test.systemProperties.spring.autoconfigure.exclude=ru.thedevs.itink.CustomExcludedAutoConfiguration"; then
+  echo "FAIL: thedevs.test.systemProperties.spring.autoconfigure.exclude not found or incorrect in $TEST_PROPS_FILE" >&2
+  exit 1
+fi
+
 echo "Published upstream artifacts and POM validation: PASSED"
 
 # 3. Downstream Fixture Setup
@@ -317,6 +382,17 @@ package ru.thedevs.consumer;
 public class ConsumerService {
     public String status() { return "consumer-ok"; }
 }
+EOF
+
+cat > "$DOWNSTREAM_DIR/consumer-mod/src/main/java/ru/thedevs/consumer/ConsumerMainAutoConfiguration.java" <<'EOF'
+package ru.thedevs.consumer;
+public class ConsumerMainAutoConfiguration {
+}
+EOF
+
+mkdir -p "$DOWNSTREAM_DIR/consumer-mod/src/main/resources/META-INF/spring"
+cat > "$DOWNSTREAM_DIR/consumer-mod/src/main/resources/META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports" <<'EOF'
+ru.thedevs.consumer.ConsumerMainAutoConfiguration
 EOF
 
 mkdir -p "$DOWNSTREAM_DIR/consumer-mod/src/test/java/ru/thedevs/consumer"
@@ -377,6 +453,11 @@ public class ConsumerAutoConfiguration {
 }
 EOF
 
+mkdir -p "$DOWNSTREAM_DIR/consumer-starter/src/main/resources/META-INF/spring"
+cat > "$DOWNSTREAM_DIR/consumer-starter/src/main/resources/META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports" <<'EOF'
+ru.thedevs.consumer.starter.ConsumerAutoConfiguration
+EOF
+
 cat > "$DOWNSTREAM_DIR/consumer-starter/build.gradle" <<'EOF'
 plugins {
     id 'java'
@@ -409,6 +490,23 @@ fi
 
 if ! echo "$CHANGELOG_CONTENT" | grep -q "ru/thedevs/consumer/liquibase/changelog.xml"; then
   echo "FAIL: Aggregate changelog missing host changelog" >&2
+  exit 1
+fi
+
+# Verify host resources were filtered into isolated directories without autoconfiguration imports
+HOST_MAIN_CHANGELOG="$DOWNSTREAM_DIR/consumer-mod/build/addon-tests/itink/host-resources/main/ru/thedevs/consumer/liquibase/changelog.xml"
+if [ ! -f "$HOST_MAIN_CHANGELOG" ]; then
+  echo "FAIL: Host main changelog not found in host-resources/main at $HOST_MAIN_CHANGELOG" >&2
+  exit 1
+fi
+
+if [ -f "$DOWNSTREAM_DIR/consumer-mod/build/addon-tests/itink/host-resources/main/META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports" ]; then
+  echo "FAIL: Host main autoconfiguration descriptor found in host-resources/main, but must be excluded!" >&2
+  exit 1
+fi
+
+if [ -f "$DOWNSTREAM_DIR/consumer-mod/build/addon-tests/itink/host-resources/starter/META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports" ]; then
+  echo "FAIL: Host starter autoconfiguration descriptor found in host-resources/starter, but must be excluded!" >&2
   exit 1
 fi
 
