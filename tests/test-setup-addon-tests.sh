@@ -94,6 +94,8 @@ public class ItinkTest {
                 "Host changelog must be resolvable via ClassLoader from host-resources");
         assertNotNull(getClass().getClassLoader().getResource("ru/thedevs/consumer/starter/starter-resource.txt"),
                 "Host starter resource must be resolvable via ClassLoader from host-resources");
+        assertNotNull(getClass().getClassLoader().getResource("ru/thedevs/consumer/orm.xml"),
+                "Host generated output dir (sourceSets.main.output.dir, e.g. Jmix orm.xml) must stay on classpath");
 
         // (a) Verify host autoconfiguration imports descriptors are excluded, while dependency descriptor is present
         Enumeration<URL> importsUrls = getClass().getClassLoader().getResources(
@@ -438,6 +440,17 @@ dependencies {
 project.afterEvaluate {
     project.dependencies.add('implementation', 'org.slf4j:slf4j-api:2.0.16')
 }
+// Emulate Jmix plugin registerGeneratedDescriptors: orm.xml generated outside processResources, exposed via output.dir
+def generatedDescriptorsDir = layout.buildDirectory.dir('tmp/entitiesEnhancing/main').get().asFile
+def generateDescriptors = tasks.register('generateDescriptors') {
+    outputs.dir(generatedDescriptorsDir)
+    doLast {
+        def orm = new File(generatedDescriptorsDir, 'ru/thedevs/consumer/orm.xml')
+        orm.parentFile.mkdirs()
+        orm.text = '<entity-mappings/>\n'
+    }
+}
+sourceSets.main.output.dir(generatedDescriptorsDir, builtBy: generateDescriptors)
 publishing {
     publications {
         javaMaven(MavenPublication) {
