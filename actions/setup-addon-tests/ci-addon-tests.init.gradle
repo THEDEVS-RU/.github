@@ -605,6 +605,9 @@ gradle.projectsEvaluated {
                  p.rootProject.subprojects.find { it.name.endsWith('-starter') }
             def starterClassesDirs = (starterProject != null && starterProject.pluginManager.hasPlugin('java')) ?
                 starterProject.sourceSets.main.output.classesDirs : p.files()
+            // Extra output dirs registered via sourceSets.main.output.dir(...), e.g. Jmix-generated persistence.xml/orm.xml
+            def starterGeneratedDirs = (starterProject != null && starterProject.pluginManager.hasPlugin('java')) ?
+                starterProject.sourceSets.main.output.dirs : p.files()
 
             def mainResDir = p.layout.buildDirectory.dir("addon-tests/${baseModule}/host-resources/main")
             def filterHostMainResources = p.tasks.maybeCreate("filterHostMainResources_${baseModule}", Sync)
@@ -631,7 +634,9 @@ gradle.projectsEvaluated {
                 return p.files(classesDir, aggregateFile.parentFile, hostResourcesDirs) +
                        addonTestClasspath +
                        p.sourceSets.main.output.classesDirs +
+                       p.sourceSets.main.output.dirs +
                        starterClassesDirs +
+                       starterGeneratedDirs +
                        runtimeClasspath
             })
 
