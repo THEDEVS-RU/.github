@@ -92,6 +92,8 @@ public class ItinkTest {
         }
         assertNotNull(getClass().getClassLoader().getResource("ru/thedevs/consumer/liquibase/changelog.xml"),
                 "Host changelog must be resolvable via ClassLoader from host-resources");
+        assertNotNull(getClass().getClassLoader().getResource("ru/thedevs/consumer/starter/starter-resource.txt"),
+                "Host starter resource must be resolvable via ClassLoader from host-resources");
 
         // (a) Verify host autoconfiguration imports descriptors are excluded, while dependency descriptor is present
         Enumeration<URL> importsUrls = getClass().getClassLoader().getResources(
@@ -453,6 +455,11 @@ public class ConsumerAutoConfiguration {
 }
 EOF
 
+mkdir -p "$DOWNSTREAM_DIR/consumer-starter/src/main/resources/ru/thedevs/consumer/starter"
+cat > "$DOWNSTREAM_DIR/consumer-starter/src/main/resources/ru/thedevs/consumer/starter/starter-resource.txt" <<'EOF'
+starter-ok
+EOF
+
 mkdir -p "$DOWNSTREAM_DIR/consumer-starter/src/main/resources/META-INF/spring"
 cat > "$DOWNSTREAM_DIR/consumer-starter/src/main/resources/META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports" <<'EOF'
 ru.thedevs.consumer.starter.ConsumerAutoConfiguration
@@ -507,6 +514,12 @@ fi
 
 if [ -f "$DOWNSTREAM_DIR/consumer-mod/build/addon-tests/itink/host-resources/starter/META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports" ]; then
   echo "FAIL: Host starter autoconfiguration descriptor found in host-resources/starter, but must be excluded!" >&2
+  exit 1
+fi
+
+HOST_STARTER_RESOURCE="$DOWNSTREAM_DIR/consumer-mod/build/addon-tests/itink/host-resources/starter/ru/thedevs/consumer/starter/starter-resource.txt"
+if [ ! -f "$HOST_STARTER_RESOURCE" ]; then
+  echo "FAIL: Host starter resource not found in host-resources/starter at $HOST_STARTER_RESOURCE" >&2
   exit 1
 fi
 
