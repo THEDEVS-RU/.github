@@ -105,6 +105,11 @@ cat > "$UPSTREAM_DIR/itink-mod/src/main/resources/META-INF/spring/org.springfram
 ru.thedevs.itink.ItinkAutoConfiguration
 EOF
 
+# Upstream module.properties in main jar (TD-2526 jar/zip classpath resolution)
+cat > "$UPSTREAM_DIR/itink-mod/src/main/resources/ru/thedevs/itink/module.properties" <<'EOF'
+jmix.core.additional-stores=itinkjar
+EOF
+
 mkdir -p "$UPSTREAM_DIR/itink-mod/src/test/java/ru/thedevs/itink"
 cat > "$UPSTREAM_DIR/itink-mod/src/test/java/ru/thedevs/itink/ItinkTest.java" <<'EOF'
 package ru.thedevs.itink;
@@ -191,16 +196,16 @@ public class ItinkTest {
                 .filter(s -> !s.isEmpty())
                 .collect(Collectors.toList());
         if (expectHostEntities) {
-            assertEquals(java.util.Set.of("hostsys", "itinkprop", "itinkfile", "consumerdata", "starterdata"),
+            assertEquals(java.util.Set.of("hostsys", "itinkprop", "itinkfile", "itinkjar", "consumerdata", "starterdata"),
                     new java.util.HashSet<>(parsedStores),
                     "jmix.core.additional-stores must contain all host and dependency stores without losing any");
-            assertEquals(5, parsedStores.size(),
+            assertEquals(6, parsedStores.size(),
                     "jmix.core.additional-stores must not contain duplicate stores: " + additionalStores);
         } else {
-            assertEquals(java.util.Set.of("itinkprop", "itinkfile"),
+            assertEquals(java.util.Set.of("itinkprop", "itinkfile", "itinkjar"),
                     new java.util.HashSet<>(parsedStores),
                     "In negative scenario, jmix.core.additional-stores must contain only dependency stores");
-            assertEquals(2, parsedStores.size(),
+            assertEquals(3, parsedStores.size(),
                     "jmix.core.additional-stores must not contain duplicates: " + additionalStores);
         }
 
@@ -520,6 +525,13 @@ if ! echo "$TEST_PROPS" | grep -q "thedevs.test.systemProperties.jmix.core.addit
   exit 1
 fi
 
+# Validate ru/thedevs/itink/module.properties inside published main jar itink-1.0.0.jar (TD-2526)
+unzip -q -o "$REPO_DIR/ru/thedevs/itink/1.0.0/itink-1.0.0.jar" -d "$TEST_DIR/unpacked-itink-main"
+if ! grep -q "jmix.core.additional-stores=itinkjar" "$TEST_DIR/unpacked-itink-main/ru/thedevs/itink/module.properties"; then
+  echo "FAIL: ru/thedevs/itink/module.properties missing or incorrect in itink-1.0.0.jar" >&2
+  exit 1
+fi
+
 echo "Published upstream artifacts and POM validation: PASSED"
 
 # 3. Downstream Fixture Setup
@@ -782,6 +794,11 @@ if ! grep -q '\[TD-2526\] testAddon_itink: jmix.core.additional-stores=' "$DOWNS
   exit 1
 fi
 
+if ! grep -q 'itinkjar' "$DOWNSTREAM_LOG"; then
+  echo "FAIL: Expected itinkjar in downstream log jmix.core.additional-stores" >&2
+  exit 1
+fi
+
 # Verify test report confirms actual execution (tests="1", failures="0", errors="0")
 REPORT_FILE="$DOWNSTREAM_DIR/consumer-mod/build/test-results/testAddon_itink/TEST-ru.thedevs.itink.ItinkTest.xml"
 if [ ! -f "$REPORT_FILE" ]; then
@@ -881,6 +898,15 @@ if [ -d "$NOENTITY_OVERLAY_DIR" ]; then
         echo "FAIL: Expected persistence-overlay to be empty for host without entities, but found $NOENTITY_FILES_COUNT files!" >&2
         exit 1
     fi
+fi
+
+if ! grep -q '\[TD-2526\] testAddon_itink: jmix.core.additional-stores=' "$NOENTITY_LOG"; then
+    echo "FAIL: Expected [TD-2526] testAddon_itink: jmix.core.additional-stores= not found in noentity log" >&2
+    exit 1
+fi
+if ! grep -q 'itinkjar' "$NOENTITY_LOG"; then
+    echo "FAIL: Expected itinkjar in noentity log jmix.core.additional-stores" >&2
+    exit 1
 fi
 
 NOENTITY_REPORT_FILE="$NOENTITY_DIR/noentity-mod/build/test-results/testAddon_itink/TEST-ru.thedevs.itink.ItinkTest.xml"
