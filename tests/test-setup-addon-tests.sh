@@ -49,10 +49,55 @@ public class ItinkService {
 }
 EOF
 
+cat > "$UPSTREAM_DIR/itink-mod/src/main/java/ru/thedevs/itink/ItinkEntity.java" <<'EOF'
+package ru.thedevs.itink;
+public class ItinkEntity {
+}
+EOF
+
+cat > "$UPSTREAM_DIR/itink-mod/src/main/java/ru/thedevs/itink/ItinkOnlyEntity.java" <<'EOF'
+package ru.thedevs.itink;
+public class ItinkOnlyEntity {
+}
+EOF
+
 cat > "$UPSTREAM_DIR/itink-mod/src/main/java/ru/thedevs/itink/ItinkAutoConfiguration.java" <<'EOF'
 package ru.thedevs.itink;
 public class ItinkAutoConfiguration {
 }
+EOF
+
+mkdir -p "$UPSTREAM_DIR/itink-mod/src/main/resources/ru/thedevs/itink"
+cat > "$UPSTREAM_DIR/itink-mod/src/main/resources/ru/thedevs/itink/persistence.xml" <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<persistence xmlns="http://xmlns.jcp.org/xml/ns/persistence" version="2.2">
+    <persistence-unit name="main">
+        <provider>io.jmix.data.impl.JmixPersistenceProvider</provider>
+        <mapping-file>ru/thedevs/itink/orm.xml</mapping-file>
+        <class>ru.thedevs.itink.ItinkEntity</class>
+        <exclude-unlisted-classes/>
+        <properties>
+            <property name="eclipselink.weaving" value="static"/>
+            <property name="io.jmix.enhancing.converters-list" value="ru.thedevs.itink.ItinkConverter"/>
+        </properties>
+    </persistence-unit>
+</persistence>
+EOF
+
+cat > "$UPSTREAM_DIR/itink-mod/src/main/resources/ru/thedevs/itink/orm.xml" <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<entity-mappings xmlns="http://xmlns.jcp.org/xml/ns/persistence/orm" version="2.2">
+    <entity class="ru.thedevs.itink.ItinkEntity">
+        <attributes>
+            <many-to-one name="ref" target-entity="ru.thedevs.itink.A"/>
+        </attributes>
+    </entity>
+    <entity class="ru.thedevs.itink.ItinkOnlyEntity">
+        <attributes>
+            <basic name="foo"/>
+        </attributes>
+    </entity>
+</entity-mappings>
 EOF
 
 mkdir -p "$UPSTREAM_DIR/itink-mod/src/main/resources/META-INF/spring"
@@ -72,6 +117,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Enumeration;
 import java.util.List;
+import java.util.stream.Collectors;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -90,46 +136,114 @@ public class ItinkTest {
             while (res.startsWith("/")) res = res.substring(1);
             assertNotNull(getClass().getClassLoader().getResource(res), "Changelog resource must be resolvable via ClassLoader: " + res);
         }
-        assertNotNull(getClass().getClassLoader().getResource("ru/thedevs/consumer/liquibase/changelog.xml"),
-                "Host changelog must be resolvable via ClassLoader from host-resources");
-        assertNotNull(getClass().getClassLoader().getResource("ru/thedevs/consumer/starter/starter-resource.txt"),
-                "Host starter resource must be resolvable via ClassLoader from host-resources");
-        assertNotNull(getClass().getClassLoader().getResource("ru/thedevs/consumer/orm.xml"),
-                "Host generated output dir (sourceSets.main.output.dir, e.g. Jmix orm.xml) must stay on classpath");
 
-        // (a) Verify host autoconfiguration imports descriptors are excluded, while dependency descriptor is present
-        Enumeration<URL> importsUrls = getClass().getClassLoader().getResources(
-                "META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports");
-        List<String> importsEntries = new ArrayList<>();
-        while (importsUrls.hasMoreElements()) {
-            URL url = importsUrls.nextElement();
-            try (BufferedReader reader = new BufferedReader(new InputStreamReader(url.openStream(), StandardCharsets.UTF_8))) {
-                String line;
-                while ((line = reader.readLine()) != null) {
-                    line = line.trim();
-                    if (!line.isEmpty() && !line.startsWith("#")) {
-                        importsEntries.add(line);
+        boolean isConsumerHost = getClass().getClassLoader().getResource("ru/thedevs/consumer/persistence.xml") != null;
+
+        if (isConsumerHost) {
+            assertNotNull(getClass().getClassLoader().getResource("ru/thedevs/consumer/liquibase/changelog.xml"),
+                    "Host changelog must be resolvable via ClassLoader from host-resources");
+            assertNotNull(getClass().getClassLoader().getResource("ru/thedevs/consumer/starter/starter-resource.txt"),
+                    "Host starter resource must be resolvable via ClassLoader from host-resources");
+            assertNotNull(getClass().getClassLoader().getResource("ru/thedevs/consumer/orm.xml"),
+                    "Host generated output dir (sourceSets.main.output.dir, e.g. Jmix orm.xml) must stay on classpath");
+
+            // (a) Verify host autoconfiguration imports descriptors are excluded, while dependency descriptor is present
+            Enumeration<URL> importsUrls = getClass().getClassLoader().getResources(
+                    "META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports");
+            List<String> importsEntries = new ArrayList<>();
+            while (importsUrls.hasMoreElements()) {
+                URL url = importsUrls.nextElement();
+                try (BufferedReader reader = new BufferedReader(new InputStreamReader(url.openStream(), StandardCharsets.UTF_8))) {
+                    String line;
+                    while ((line = reader.readLine()) != null) {
+                        line = line.trim();
+                        if (!line.isEmpty() && !line.startsWith("#")) {
+                            importsEntries.add(line);
+                        }
                     }
                 }
             }
-        }
-        assertTrue(importsEntries.contains("ru.thedevs.itink.ItinkAutoConfiguration"),
-                "Dependency autoconfiguration must be present on classpath: " + importsEntries);
-        assertFalse(importsEntries.contains("ru.thedevs.consumer.ConsumerMainAutoConfiguration"),
-                "Host main autoconfiguration descriptor must be excluded from classpath: " + importsEntries);
-        assertFalse(importsEntries.contains("ru.thedevs.consumer.starter.ConsumerAutoConfiguration"),
-                "Host starter autoconfiguration descriptor must be excluded from classpath: " + importsEntries);
+            assertTrue(importsEntries.contains("ru.thedevs.itink.ItinkAutoConfiguration"),
+                    "Dependency autoconfiguration must be present on classpath: " + importsEntries);
+            assertFalse(importsEntries.contains("ru.thedevs.consumer.ConsumerMainAutoConfiguration"),
+                    "Host main autoconfiguration descriptor must be excluded from classpath: " + importsEntries);
+            assertFalse(importsEntries.contains("ru.thedevs.consumer.starter.ConsumerAutoConfiguration"),
+                    "Host starter autoconfiguration descriptor must be excluded from classpath: " + importsEntries);
 
-        // (б) Verify host classes are preserved and loadable from classpath
-        assertNotNull(Class.forName("ru.thedevs.consumer.starter.ConsumerAutoConfiguration"),
-                "Host starter class must be loadable");
-        assertNotNull(Class.forName("ru.thedevs.consumer.ConsumerService"),
-                "Host main class must be loadable");
+            // (б) Verify host classes are preserved and loadable from classpath
+            assertNotNull(Class.forName("ru.thedevs.consumer.starter.ConsumerAutoConfiguration"),
+                    "Host starter class must be loadable");
+            assertNotNull(Class.forName("ru.thedevs.consumer.ConsumerService"),
+                    "Host main class must be loadable");
+        }
 
         // (в) Verify dependency test system properties are preserved without being overwritten by harness
         assertEquals("ru.thedevs.itink.CustomExcludedAutoConfiguration",
                 System.getProperty("spring.autoconfigure.exclude"),
                 "Dependency spring.autoconfigure.exclude system property must be preserved");
+
+        // TD-2521: Persistence Unit Overlay & Orm.xml Shadowing checks
+        URL puUrl = getClass().getClassLoader().getResource("ru/thedevs/itink/persistence.xml");
+        assertNotNull(puUrl, "ru/thedevs/itink/persistence.xml must be resolvable via ClassLoader");
+        String puText;
+        try (BufferedReader reader = new BufferedReader(new InputStreamReader(puUrl.openStream(), StandardCharsets.UTF_8))) {
+            puText = reader.lines().collect(Collectors.joining("\n"));
+        }
+
+        URL ormUrl = getClass().getClassLoader().getResource("ru/thedevs/itink/orm.xml");
+        assertNotNull(ormUrl, "ru/thedevs/itink/orm.xml must be resolvable via ClassLoader");
+        String ormText;
+        try (BufferedReader reader = new BufferedReader(new InputStreamReader(ormUrl.openStream(), StandardCharsets.UTF_8))) {
+            ormText = reader.lines().collect(Collectors.joining("\n"));
+        }
+
+        if (isConsumerHost) {
+            // (3.3.a) First persistence.xml contains both ItinkEntity, ConsumerEntity, itink orm.xml, consumer orm.xml,
+            // exactly one occurrence of each class, and exclude-unlisted-classes
+            assertTrue(puText.contains("ru.thedevs.itink.ItinkEntity"), "Merged persistence.xml must contain ItinkEntity");
+            assertTrue(puText.contains("ru.thedevs.consumer.ConsumerEntity"), "Merged persistence.xml must contain ConsumerEntity");
+            assertTrue(puText.contains("ru/thedevs/itink/orm.xml"), "Merged persistence.xml must contain itink orm.xml");
+            assertTrue(puText.contains("ru/thedevs/consumer/orm.xml"), "Merged persistence.xml must contain consumer orm.xml");
+            assertTrue(puText.contains("<exclude-unlisted-classes"), "Merged persistence.xml must contain exclude-unlisted-classes");
+
+            int countItinkCls = (puText.length() - puText.replace("<class>ru.thedevs.itink.ItinkEntity</class>", "").length()) / "<class>ru.thedevs.itink.ItinkEntity</class>".length();
+            assertEquals(1, countItinkCls, "Exactly one occurrence of <class>ru.thedevs.itink.ItinkEntity</class>");
+            int countConsumerCls = (puText.length() - puText.replace("<class>ru.thedevs.consumer.ConsumerEntity</class>", "").length()) / "<class>ru.thedevs.consumer.ConsumerEntity</class>".length();
+            assertEquals(1, countConsumerCls, "Exactly one occurrence of <class>ru.thedevs.consumer.ConsumerEntity</class>");
+
+            // (3.3.b, d) converters-list contains elements of dependency and host, separated by ;, without duplicates
+            assertTrue(puText.contains("ru.thedevs.itink.ItinkConverter"), "Converters list must contain ItinkConverter");
+            assertTrue(puText.contains("ru.thedevs.consumer.ConsumerConverter"), "Converters list must contain ConsumerConverter");
+            assertTrue(puText.contains("value=\"ru.thedevs.itink.ItinkConverter;ru.thedevs.consumer.ConsumerConverter\"") ||
+                       puText.contains("value=\"ru.thedevs.consumer.ConsumerConverter;ru.thedevs.itink.ItinkConverter\""),
+                       "Converters list must be separated by ; and contain both converters without duplicates");
+
+            // (3.3.c) Host descriptor ru/thedevs/consumer/persistence.xml remains accessible and intact
+            URL hostPuUrl = getClass().getClassLoader().getResource("ru/thedevs/consumer/persistence.xml");
+            assertNotNull(hostPuUrl, "Host descriptor ru/thedevs/consumer/persistence.xml must remain accessible via ClassLoader");
+
+            // (3.5) Conflict fixture: ru/thedevs/itink/orm.xml does NOT contain ItinkEntity, but DOES contain ItinkOnlyEntity
+            assertFalse(ormText.contains("ru.thedevs.itink.ItinkEntity"), "Shadowed orm.xml must not contain ItinkEntity superseded by host");
+            assertTrue(ormText.contains("ru.thedevs.itink.ItinkOnlyEntity"), "Shadowed orm.xml must preserve ItinkOnlyEntity");
+
+            // Host orm.xml remains intact and contains target-entity="ru.thedevs.consumer.B"
+            URL hostOrmUrl = getClass().getClassLoader().getResource("ru/thedevs/consumer/orm.xml");
+            assertNotNull(hostOrmUrl, "Host orm.xml must remain accessible via ClassLoader");
+            String hostOrmText;
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(hostOrmUrl.openStream(), StandardCharsets.UTF_8))) {
+                hostOrmText = reader.lines().collect(Collectors.joining("\n"));
+            }
+            assertTrue(hostOrmText.contains("target-entity=\"ru.thedevs.consumer.B\""), "Host orm.xml must contain target-entity ru.thedevs.consumer.B");
+        } else {
+            // (3.6) Negative scenario (host without entities): ClassLoader returns original dependency descriptors untouched
+            assertTrue(puText.contains("ru.thedevs.itink.ItinkEntity"), "Original persistence.xml must contain ItinkEntity");
+            assertFalse(puText.contains("ConsumerEntity"), "Original persistence.xml must not contain ConsumerEntity");
+            assertTrue(puText.contains("ru.thedevs.itink.ItinkConverter"), "Original converters list must contain ItinkConverter");
+            assertFalse(puText.contains("ConsumerConverter"), "Original converters list must not contain ConsumerConverter");
+
+            assertTrue(ormText.contains("ru.thedevs.itink.ItinkEntity"), "Original orm.xml must contain ItinkEntity when host has no entities");
+            assertTrue(ormText.contains("ru.thedevs.itink.ItinkOnlyEntity"), "Original orm.xml must contain ItinkOnlyEntity");
+        }
     }
 }
 EOF
@@ -388,6 +502,12 @@ public class ConsumerService {
 }
 EOF
 
+cat > "$DOWNSTREAM_DIR/consumer-mod/src/main/java/ru/thedevs/consumer/ConsumerEntity.java" <<'EOF'
+package ru.thedevs.consumer;
+public class ConsumerEntity {
+}
+EOF
+
 cat > "$DOWNSTREAM_DIR/consumer-mod/src/main/java/ru/thedevs/consumer/ConsumerMainAutoConfiguration.java" <<'EOF'
 package ru.thedevs.consumer;
 public class ConsumerMainAutoConfiguration {
@@ -440,14 +560,38 @@ dependencies {
 project.afterEvaluate {
     project.dependencies.add('implementation', 'org.slf4j:slf4j-api:2.0.16')
 }
-// Emulate Jmix plugin registerGeneratedDescriptors: orm.xml generated outside processResources, exposed via output.dir
+// Emulate Jmix plugin registerGeneratedDescriptors: persistence.xml & orm.xml generated outside processResources, exposed via output.dir
 def generatedDescriptorsDir = layout.buildDirectory.dir('tmp/entitiesEnhancing/main').get().asFile
 def generateDescriptors = tasks.register('generateDescriptors') {
     outputs.dir(generatedDescriptorsDir)
     doLast {
         def orm = new File(generatedDescriptorsDir, 'ru/thedevs/consumer/orm.xml')
         orm.parentFile.mkdirs()
-        orm.text = '<entity-mappings/>\n'
+        orm.text = '''<?xml version="1.0" encoding="UTF-8"?>
+<entity-mappings xmlns="http://xmlns.jcp.org/xml/ns/persistence/orm" version="2.2">
+    <entity class="ru.thedevs.itink.ItinkEntity">
+        <attributes>
+            <many-to-one name="ref" target-entity="ru.thedevs.consumer.B"/>
+        </attributes>
+    </entity>
+</entity-mappings>
+'''
+        def pu = new File(generatedDescriptorsDir, 'ru/thedevs/consumer/persistence.xml')
+        pu.parentFile.mkdirs()
+        pu.text = '''<?xml version="1.0" encoding="UTF-8"?>
+<persistence xmlns="http://xmlns.jcp.org/xml/ns/persistence" version="2.2">
+    <persistence-unit name="main">
+        <provider>io.jmix.data.impl.JmixPersistenceProvider</provider>
+        <mapping-file>ru/thedevs/consumer/orm.xml</mapping-file>
+        <class>ru.thedevs.consumer.ConsumerEntity</class>
+        <exclude-unlisted-classes/>
+        <properties>
+            <property name="eclipselink.weaving" value="static"/>
+            <property name="io.jmix.enhancing.converters-list" value="ru.thedevs.consumer.ConsumerConverter"/>
+        </properties>
+    </persistence-unit>
+</persistence>
+'''
     }
 }
 sourceSets.main.output.dir(generatedDescriptorsDir, builtBy: generateDescriptors)
@@ -488,10 +632,8 @@ dependencies {
 EOF
 
 echo "Running downstream build and testAddonDependencies with ci-addon-tests.init.gradle..."
-(
-  cd "$DOWNSTREAM_DIR"
-  gradle -I "$INIT_SCRIPT" :consumer-mod:testAddonDependencies --no-daemon
-)
+DOWNSTREAM_BUILD_OUTPUT=$(cd "$DOWNSTREAM_DIR" && gradle -I "$INIT_SCRIPT" :consumer-mod:testAddonDependencies --no-daemon 2>&1)
+echo "$DOWNSTREAM_BUILD_OUTPUT"
 
 # 4. Validate Downstream Execution Results
 echo "Validating downstream testAddon execution results..."
@@ -543,6 +685,31 @@ if [ ! -f "$UNPACKED_TEST_CLASS" ]; then
   exit 1
 fi
 
+# Verify persistence overlay files (TD-2521)
+OVERLAY_PU="$DOWNSTREAM_DIR/consumer-mod/build/addon-tests/itink/persistence-overlay/ru/thedevs/itink/persistence.xml"
+if [ ! -f "$OVERLAY_PU" ]; then
+  echo "FAIL: Overlay persistence.xml was not created at $OVERLAY_PU" >&2
+  exit 1
+fi
+
+OVERLAY_ORM="$DOWNSTREAM_DIR/consumer-mod/build/addon-tests/itink/persistence-overlay/ru/thedevs/itink/orm.xml"
+if [ ! -f "$OVERLAY_ORM" ]; then
+  echo "FAIL: Shadowing overlay orm.xml was not created at $OVERLAY_ORM" >&2
+  exit 1
+fi
+
+# Verify original published itink-1.0.0.jar is intact
+ORIG_PU=$(unzip -p "$REPO_DIR/ru/thedevs/itink/1.0.0/itink-1.0.0.jar" ru/thedevs/itink/persistence.xml)
+if echo "$ORIG_PU" | grep -q "ConsumerEntity"; then
+  echo "FAIL: Original published itink-1.0.0.jar was modified to include ConsumerEntity!" >&2
+  exit 1
+fi
+
+if ! echo "$DOWNSTREAM_BUILD_OUTPUT" | grep -q -- "(-1 entity entries superseded by host)"; then
+  echo "FAIL: Gradle log missing '(-1 entity entries superseded by host)'" >&2
+  exit 1
+fi
+
 # Verify test report confirms actual execution (tests="1", failures="0", errors="0")
 REPORT_FILE="$DOWNSTREAM_DIR/consumer-mod/build/test-results/testAddon_itink/TEST-ru.thedevs.itink.ItinkTest.xml"
 if [ ! -f "$REPORT_FILE" ]; then
@@ -557,6 +724,103 @@ if ! grep -q 'tests="1"' "$REPORT_FILE" || ! grep -q 'failures="0"' "$REPORT_FIL
 fi
 
 echo "Downstream testAddon execution validation: PASSED"
+
+# 5. Validate Negative Scenario: host without entities has empty/absent persistence-overlay (TD-2521)
+echo "Testing negative scenario: host without entities..."
+NOENTITY_DIR="$TEST_DIR/noentity-consumer"
+mkdir -p "$NOENTITY_DIR"
+cat > "$NOENTITY_DIR/settings.gradle" <<'EOF'
+rootProject.name = 'noentity-consumer'
+include 'noentity-mod'
+EOF
+
+cat > "$NOENTITY_DIR/build.gradle" <<EOF
+allprojects {
+    group = 'ru.thedevs'
+    version = '1.0.0'
+    repositories {
+        maven { url = uri("${REPO_DIR}") }
+        mavenCentral()
+    }
+}
+EOF
+
+mkdir -p "$NOENTITY_DIR/noentity-mod/src/main/java/ru/thedevs/noentity"
+cat > "$NOENTITY_DIR/noentity-mod/src/main/java/ru/thedevs/noentity/NoEntityService.java" <<'EOF'
+package ru.thedevs.noentity;
+public class NoEntityService {
+}
+EOF
+
+mkdir -p "$NOENTITY_DIR/noentity-mod/src/test/java/ru/thedevs/noentity"
+cat > "$NOENTITY_DIR/noentity-mod/src/test/java/ru/thedevs/noentity/NoEntityTest.java" <<'EOF'
+package ru.thedevs.noentity;
+import org.junit.jupiter.api.Test;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+public class NoEntityTest {
+    @Test
+    void testOk() { assertTrue(true); }
+}
+EOF
+
+cat > "$NOENTITY_DIR/noentity-mod/build.gradle" <<'EOF'
+plugins {
+    id 'java'
+}
+dependencies {
+    implementation 'ru.thedevs:upstream-starter:1.0.0'
+    testImplementation 'org.junit.jupiter:junit-jupiter-api:5.10.2'
+    testRuntimeOnly 'org.junit.jupiter:junit-jupiter-engine:5.10.2'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher:1.10.2'
+}
+// Emulate Jmix plugin generating empty descriptors without classes
+def generatedDescriptorsDir = layout.buildDirectory.dir('tmp/entitiesEnhancing/main').get().asFile
+def generateDescriptors = tasks.register('generateDescriptors') {
+    outputs.dir(generatedDescriptorsDir)
+    doLast {
+        def pu = new File(generatedDescriptorsDir, 'ru/thedevs/noentity/persistence.xml')
+        pu.parentFile.mkdirs()
+        pu.text = '''<?xml version="1.0" encoding="UTF-8"?>
+<persistence xmlns="http://xmlns.jcp.org/xml/ns/persistence" version="2.2">
+    <persistence-unit name="main">
+        <provider>io.jmix.data.impl.JmixPersistenceProvider</provider>
+        <exclude-unlisted-classes/>
+    </persistence-unit>
+</persistence>
+'''
+        def orm = new File(generatedDescriptorsDir, 'ru/thedevs/noentity/orm.xml')
+        orm.parentFile.mkdirs()
+        orm.text = '<entity-mappings/>\n'
+    }
+}
+sourceSets.main.output.dir(generatedDescriptorsDir, builtBy: generateDescriptors)
+EOF
+
+(
+    cd "$NOENTITY_DIR"
+    gradle -I "$INIT_SCRIPT" :noentity-mod:testAddonDependencies --no-daemon
+)
+
+NOENTITY_OVERLAY_DIR="$NOENTITY_DIR/noentity-mod/build/addon-tests/itink/persistence-overlay"
+if [ -d "$NOENTITY_OVERLAY_DIR" ]; then
+    NOENTITY_FILES_COUNT=$(find "$NOENTITY_OVERLAY_DIR" -type f | wc -l)
+    if [ "$NOENTITY_FILES_COUNT" -ne 0 ]; then
+        echo "FAIL: Expected persistence-overlay to be empty for host without entities, but found $NOENTITY_FILES_COUNT files!" >&2
+        exit 1
+    fi
+fi
+
+NOENTITY_REPORT_FILE="$NOENTITY_DIR/noentity-mod/build/test-results/testAddon_itink/TEST-ru.thedevs.itink.ItinkTest.xml"
+if [ ! -f "$NOENTITY_REPORT_FILE" ]; then
+    echo "FAIL: Test report file for noentity-mod not found at $NOENTITY_REPORT_FILE" >&2
+    exit 1
+fi
+if ! grep -q 'tests="1"' "$NOENTITY_REPORT_FILE" || ! grep -q 'failures="0"' "$NOENTITY_REPORT_FILE" || ! grep -q 'errors="0"' "$NOENTITY_REPORT_FILE"; then
+    echo "FAIL: Test report for noentity-mod does not indicate passing tests without failures" >&2
+    cat "$NOENTITY_REPORT_FILE" >&2
+    exit 1
+fi
+echo "Negative scenario (host without entities): PASSED"
 
 # 5. Validate Strict Mode vs Pre-rollout for missing tests artifact
 # We verify in the SAME directory that switching to strict mode invalidates UP-TO-DATE and fails.
