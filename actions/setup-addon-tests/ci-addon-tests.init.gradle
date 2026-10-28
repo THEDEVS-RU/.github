@@ -28,6 +28,17 @@ import org.w3c.dom.Element
 import org.w3c.dom.Node
 import org.w3c.dom.NodeList
 
+def createSafeDocumentBuilder() {
+    def dbf = DocumentBuilderFactory.newInstance()
+    dbf.setNamespaceAware(true)
+    try {
+        dbf.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true)
+        dbf.setFeature("http://xml.org/sax/features/external-general-entities", false)
+        dbf.setFeature("http://xml.org/sax/features/external-parameter-entities", false)
+    } catch (Exception ignored) {}
+    return dbf.newDocumentBuilder()
+}
+
 def cleanXmlWhitespace(Node node) {
     def children = node.childNodes
     for (int i = children.length - 1; i >= 0; i--) {
@@ -38,6 +49,34 @@ def cleanXmlWhitespace(Node node) {
             cleanXmlWhitespace(child)
         }
     }
+}
+
+def localXmlTag(Node node) {
+    return (node.localName ?: node.nodeName).replaceFirst('^.*:', '')
+}
+
+def findInsertBefore(Element parent, List<String> targetTags) {
+    def children = parent.childNodes
+    for (int i = 0; i < children.length; i++) {
+        def ch = children.item(i)
+        if (ch.nodeType == Node.ELEMENT_NODE) {
+            def tag = localXmlTag(ch)
+            if (targetTags.contains(tag)) {
+                return ch
+            }
+        }
+    }
+    return null
+}
+
+def textValues(Element parent, String tagName) {
+    def values = new LinkedHashSet<String>()
+    def nodes = parent.getElementsByTagName(tagName)
+    for (int i = 0; i < nodes.length; i++) {
+        def txt = nodes.item(i).textContent?.trim()
+        if (txt) values.add(txt)
+    }
+    return values
 }
 
 def writeXmlDocument(Document doc, File destFile) {
@@ -670,9 +709,6 @@ gradle.projectsEvaluated {
                 hostOutputDirs.addAll(starterGeneratedDirs.files)
                 hostOutputDirs = hostOutputDirs.findAll { it != null && it.exists() && it.isDirectory() }
 
-                def dbf = DocumentBuilderFactory.newInstance()
-                dbf.setNamespaceAware(true)
-
                 // storeFileName -> [classes: Set, mappingFiles: Set, properties: Map, converters: Set, hostOrmClasses: Set]
                 def hostDescriptorsByFileName = new LinkedHashMap<String, Map>()
 
@@ -691,17 +727,10 @@ gradle.projectsEvaluated {
                             })
 
                             try {
-                                def doc = f.withInputStream { is -> dbf.newDocumentBuilder().parse(is) }
-                                def classNodes = doc.getElementsByTagName("class")
-                                for (int i = 0; i < classNodes.length; i++) {
-                                    def txt = classNodes.item(i).textContent?.trim()
-                                    if (txt) storeInfo.classes.add(txt)
-                                }
-                                def mfNodes = doc.getElementsByTagName("mapping-file")
-                                for (int i = 0; i < mfNodes.length; i++) {
-                                    def txt = mfNodes.item(i).textContent?.trim()
-                                    if (txt) storeInfo.mappingFiles.add(txt)
-                                }
+                                def doc = f.withInputStream { is -> createSafeDocumentBuilder().parse(is) }
+                                storeInfo.classes.addAll(textValues(doc.documentElement, "class"))
+                                storeInfo.mappingFiles.addAll(textValues(doc.documentElement, "mapping-file"))
+
                                 def propNodes = doc.getElementsByTagName("property")
                                 for (int i = 0; i < propNodes.length; i++) {
                                     def pEl = propNodes.item(i) as Element
@@ -736,14 +765,14 @@ gradle.projectsEvaluated {
                         File hostOrmFile = hostOutputDirs.collect { new File(it, mfPath) }.find { it.exists() && it.isFile() }
                         if (hostOrmFile != null) {
                             try {
-                                def ormDoc = hostOrmFile.withInputStream { is -> dbf.newDocumentBuilder().parse(is) }
+                                def ormDoc = hostOrmFile.withInputStream { is -> createSafeDocumentBuilder().parse(is) }
                                 def root = ormDoc.documentElement
                                 def children = root.childNodes
                                 for (int i = 0; i < children.length; i++) {
                                     def child = children.item(i)
                                     if (child.nodeType == Node.ELEMENT_NODE) {
                                         def el = child as Element
-                                        def tag = (el.localName ?: el.tagName).replaceFirst('^.*:', '')
+                                        def tag = localXmlTag(el)
                                         if (['entity', 'mapped-superclass', 'embeddable'].contains(tag)) {
                                             def cls = el.getAttribute('class')?.trim()
                                             if (cls) storeInfo.hostOrmClasses.add(cls)
@@ -819,19 +848,19 @@ gradle.projectsEvaluated {
                     return
                 }
 
-                def readResourceFromDepRoots = { String resourcePath ->
+                def withResourceInputStream = { String resourcePath, Closure consumer ->
                     for (root in depRoots) {
                         if (root.type == 'dir') {
                             def f = new File(root.file, resourcePath)
                             if (f.exists() && f.isFile()) {
-                                return [root: root, text: f.getText('UTF-8'), file: f]
+                                return f.withInputStream { is -> consumer(is) }
                             }
                         } else if (root.type == 'jar') {
                             def zf = new ZipFile(root.file)
                             try {
                                 def entry = zf.getEntry(resourcePath)
                                 if (entry != null && !entry.isDirectory()) {
-                                    return [root: root, text: zf.getInputStream(entry).getText('UTF-8')]
+                                    return zf.getInputStream(entry).withStream { is -> consumer(is) }
                                 }
                             } finally {
                                 zf.close()
@@ -842,50 +871,36 @@ gradle.projectsEvaluated {
                 }
 
                 // 3 & 4. Merge candidates and create shadowing copies of mapping files
+                def processedMappingFiles = new LinkedHashSet<String>()
+
                 matchingCandidates.each { candidateRelPath, cand ->
                     def storeName = cand.fileName
                     def hostInfo = hostDescriptorsByFileName[storeName]
-                    def res = readResourceFromDepRoots(candidateRelPath)
-                    if (res == null || res.text == null) return
 
-                    def doc = dbf.newDocumentBuilder().parse(new ByteArrayInputStream(res.text.getBytes(StandardCharsets.UTF_8)))
+                    Document doc = null
+                    try {
+                        doc = withResourceInputStream(candidateRelPath) { is ->
+                            createSafeDocumentBuilder().parse(is)
+                        }
+                    } catch (Exception e) {
+                        println "::warning::[TD-2521] Failed to parse candidate descriptor '${candidateRelPath}': ${e.message}"
+                        return
+                    }
+                    if (doc == null) return
+
                     def puNodes = doc.getElementsByTagName("persistence-unit")
                     if (puNodes.length == 0) return
                     def pu = puNodes.item(0) as Element
 
-                    def depClasses = new LinkedHashSet<String>()
-                    def classNodes = pu.getElementsByTagName("class")
-                    for (int i = 0; i < classNodes.length; i++) {
-                        def txt = classNodes.item(i).textContent?.trim()
-                        if (txt) depClasses.add(txt)
-                    }
+                    def depClasses = textValues(pu, "class")
+                    def depMappingFiles = textValues(pu, "mapping-file")
 
-                    def depMappingFiles = new LinkedHashSet<String>()
-                    def mfNodes = pu.getElementsByTagName("mapping-file")
-                    for (int i = 0; i < mfNodes.length; i++) {
-                        def txt = mfNodes.item(i).textContent?.trim()
-                        if (txt) depMappingFiles.add(txt)
-                    }
-
-                    def findMfInsertBefore = {
-                        def children = pu.childNodes
-                        for (int i = 0; i < children.length; i++) {
-                            def ch = children.item(i)
-                            if (ch.nodeType == Node.ELEMENT_NODE) {
-                                def tag = (ch.localName ?: ch.tagName).replaceFirst('^.*:', '')
-                                if (['jar-file', 'class', 'exclude-unlisted-classes', 'shared-cache-mode', 'validation-mode', 'properties'].contains(tag)) {
-                                    return ch
-                                }
-                            }
-                        }
-                        return null
-                    }
-
+                    def mfInsertBeforeTags = ['jar-file', 'class', 'exclude-unlisted-classes', 'shared-cache-mode', 'validation-mode', 'properties']
                     hostInfo.mappingFiles.each { hostMf ->
                         if (!depMappingFiles.contains(hostMf)) {
                             def newMf = doc.createElementNS(pu.namespaceURI, "mapping-file")
                             newMf.textContent = hostMf
-                            def refNode = findMfInsertBefore()
+                            def refNode = findInsertBefore(pu, mfInsertBeforeTags)
                             if (refNode != null) {
                                 pu.insertBefore(newMf, refNode)
                             } else {
@@ -894,26 +909,13 @@ gradle.projectsEvaluated {
                         }
                     }
 
-                    def findClassInsertBefore = {
-                        def children = pu.childNodes
-                        for (int i = 0; i < children.length; i++) {
-                            def ch = children.item(i)
-                            if (ch.nodeType == Node.ELEMENT_NODE) {
-                                def tag = (ch.localName ?: ch.tagName).replaceFirst('^.*:', '')
-                                if (['exclude-unlisted-classes', 'shared-cache-mode', 'validation-mode', 'properties'].contains(tag)) {
-                                    return ch
-                                }
-                            }
-                        }
-                        return null
-                    }
-
+                    def classInsertBeforeTags = ['exclude-unlisted-classes', 'shared-cache-mode', 'validation-mode', 'properties']
                     int addedHostClasses = 0
                     hostInfo.classes.each { hostCls ->
                         if (!depClasses.contains(hostCls)) {
                             def newCls = doc.createElementNS(pu.namespaceURI, "class")
                             newCls.textContent = hostCls
-                            def refNode = findClassInsertBefore()
+                            def refNode = findInsertBefore(pu, classInsertBeforeTags)
                             if (refNode != null) {
                                 pu.insertBefore(newCls, refNode)
                             } else {
@@ -979,43 +981,50 @@ gradle.projectsEvaluated {
 
                     // Shadowing copies of dependency mapping files
                     depMappingFiles.each { mappingFile ->
+                        if (!processedMappingFiles.add(mappingFile)) {
+                            return
+                        }
                         if (hostInfo.mappingFiles.contains(mappingFile)) {
                             println "::warning::[TD-2521] Dependency mapping-file '${mappingFile}' collides with host mapping-file path. Skipping shadowing copy."
                             return
                         }
 
-                        def mfRes = readResourceFromDepRoots(mappingFile)
-                        if (mfRes == null || mfRes.text == null) {
+                        Document mfDoc = null
+                        try {
+                            mfDoc = withResourceInputStream(mappingFile) { is ->
+                                createSafeDocumentBuilder().parse(is)
+                            }
+                        } catch (Exception e) {
+                            println "::warning::[TD-2521] Failed to parse mapping-file '${mappingFile}': ${e.message}"
+                            return
+                        }
+
+                        if (mfDoc == null) {
                             println "::warning::[TD-2521] Dependency mapping-file '${mappingFile}' not found in dependency roots. Skipping shadowing copy."
                             return
                         }
 
-                        try {
-                            def mfDoc = dbf.newDocumentBuilder().parse(new ByteArrayInputStream(mfRes.text.getBytes(StandardCharsets.UTF_8)))
-                            def mfRoot = mfDoc.documentElement
-                            int removedCount = 0
-                            def mfChildren = mfRoot.childNodes
-                            for (int i = mfChildren.length - 1; i >= 0; i--) {
-                                def ch = mfChildren.item(i)
-                                if (ch.nodeType == Node.ELEMENT_NODE) {
-                                    def el = ch as Element
-                                    def tag = (el.localName ?: el.tagName).replaceFirst('^.*:', '')
-                                    if (['entity', 'mapped-superclass', 'embeddable'].contains(tag)) {
-                                        def cls = el.getAttribute('class')?.trim()
-                                        if (cls && hostInfo.hostOrmClasses.contains(cls)) {
-                                            mfRoot.removeChild(el)
-                                            removedCount++
-                                        }
+                        def mfRoot = mfDoc.documentElement
+                        int removedCount = 0
+                        def mfChildren = mfRoot.childNodes
+                        for (int i = mfChildren.length - 1; i >= 0; i--) {
+                            def ch = mfChildren.item(i)
+                            if (ch.nodeType == Node.ELEMENT_NODE) {
+                                def el = ch as Element
+                                def tag = localXmlTag(el)
+                                if (['entity', 'mapped-superclass', 'embeddable'].contains(tag)) {
+                                    def cls = el.getAttribute('class')?.trim()
+                                    if (cls && hostInfo.hostOrmClasses.contains(cls)) {
+                                        mfRoot.removeChild(el)
+                                        removedCount++
                                     }
                                 }
                             }
-
-                            def mfTargetFile = new File(overlayDir, mappingFile)
-                            writeXmlDocument(mfDoc, mfTargetFile)
-                            println "[TD-2521] Persistence overlay for '${baseModule}': ${mappingFile} (-${removedCount} entity entries superseded by host)"
-                        } catch (Exception e) {
-                            println "::warning::[TD-2521] Failed to process mapping-file '${mappingFile}': ${e.message}"
                         }
+
+                        def mfTargetFile = new File(overlayDir, mappingFile)
+                        writeXmlDocument(mfDoc, mfTargetFile)
+                        println "[TD-2521] Persistence overlay for '${baseModule}': ${mappingFile} (-${removedCount} entity entries superseded by host)"
                     }
                 }
             }
@@ -1042,13 +1051,7 @@ gradle.projectsEvaluated {
                 if (testState.skippedPreRollout || testState.testsDisabled) {
                     return p.files()
                 }
-                boolean overlayHasFiles = false
-                if (overlayDir.exists()) {
-                    overlayDir.traverse(type: groovy.io.FileType.FILES, maxDepth: 10) { f ->
-                        overlayHasFiles = true
-                        return groovy.io.FileVisitResult.TERMINATE
-                    }
-                }
+                boolean overlayHasFiles = overlayDir.exists() && !p.fileTree(overlayDir).isEmpty()
                 def overlayFiles = overlayHasFiles ? p.files(overlayDir) : p.files()
                 return overlayFiles +
                        p.files(classesDir, aggregateFile.parentFile, hostResourcesDirs) +
