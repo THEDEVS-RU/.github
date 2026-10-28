@@ -10,7 +10,7 @@
 
 ---
 
-## 2. setup-addon-tests: изоляция тестов зависимостей (TD-2039, TD-2499, TD-2521, TD-2526)
+## 2. setup-addon-tests: изоляция тестов зависимостей (TD-2039, TD-2499, TD-2521, TD-2526, TD-2533, TD-2544)
 
 Составной action `actions/setup-addon-tests` и его канонический init-скрипт `actions/setup-addon-tests/ci-addon-tests.init.gradle` реализуют архитектуру запуска тестов прямых зависимостей (`testAddon_<dep>`) в контексте хост-проекта.
 
@@ -21,7 +21,7 @@
 2. `build/addon-tests/<dep>/classes` — каталог распакованного артефакта тестов зависимости (`<dep>-tests.jar`);
 3. `build/addon-tests/<dep>/aggregate-changelog.xml` — каталог агрегированного Liquibase-мастера;
 4. `build/addon-tests/<dep>/host-resources/main` и `host-resources/starter` — каталоги отфильтрованных ресурсов хоста (TD-2499);
-5. `addonTestClasspath_<dep>` — транзитивные зависимости тестов (разрешаются согласованно с `runtimeClasspath`);
+5. `addonTestClasspath_<dep>` — транзитивные зависимости тестов (разрешаются согласованно с `testRuntimeClasspath` хоста; платформы `ru.thedevs` хоста применяются в той же категории, что и в графе хоста (`platform` или `enforcedPlatform`));
 6. `sourceSets.main.output.classesDirs` — скомпилированные классы основного модуля хоста;
 7. `sourceSets.main.output.dirs` — сгенерированные дескрипторы хоста (`build/generated/jmix-descriptors/main`);
 8. `starterClassesDirs` и `starterGeneratedDirs` — классы и сгенерированные дескрипторы сопутствующего `-starter` модуля хоста (при наличии);
@@ -138,6 +138,30 @@ Changelog миграций модуля Jmix обязан располагать
 - Флаг `liquibase.allowDuplicatedChangesetIdentifiers=true` пропускает случайные дубли changeSet с одинаковым id/автором внутри одного файла/пути в контексте `testAddon_*`. Такие дубли по-прежнему ловятся собственными тестами модулей и production-запуском хоста.
 - Добавление changelog транзитивных модулей в схему `testAddon` может выявить ранее скрытые ошибки миграций на реальной СУБД (PostgreSQL), что является ожидаемой платой за соответствие боевой схеме.
 
+### Версии тестовых библиотек в addonTestClasspath (TD-2544)
+
+#### Зачем нужно
+При публикации `<dep>-tests.jar` init-скрипт фиксирует в POM runtime-зависимости с версиями, разрешёнными на момент публикации зависимости (например, `core-test:3.0.0.86`).
+Тестовые библиотеки платформы (`ru.thedevs:core-test`, `ru.thedevs:coreui-test`) объявляются хостом в `testImplementation` и отсутствуют в `runtimeClasspath` хоста. Ранее `addonTestClasspath_<dep>` согласовывался только с `runtimeClasspath`, из-за чего устаревший пин тестовой библиотеки из POM зависимости не перекрывался хостом, а правки базовых тестовых классов (например, `AbstractPostgresIntegrationTest`) не доходили до `testAddon_*` без перепубликации каждой зависимости.
+
+#### Механизм решения (два слоя)
+Версии тестовых библиотек определяются хостом через два взаимодополняющих слоя:
+1. **Слой 1 — Согласование с `testRuntimeClasspath`:**
+   Конфигурация `addonTestClasspath_<dep>` вызывает `shouldResolveConsistentlyWith(testRuntimeClasspath)` (при отсутствии `testRuntimeClasspath` — fallback на `runtimeClasspath`). Поскольку `testRuntimeClasspath` включает тестовые зависимости хоста, все тестовые библиотеки, объявленные хостом (`core-test`, `coreui-test`, `jmix-flowui-test-assist` и др.), согласуются с версиями хоста.
+2. **Слой 2 — Платформы BOM хоста с сохранением категории:**
+   Для хостов, у которых конкретная тестовая библиотека не объявлена напрямую в `testImplementation` (например, `addon-core-gps`), в `addonTestClasspath_<dep>` транслируются платформы `ru.thedevs` из `runtimeClasspath` хоста. Платформы добавляются в той же категории, в какой их разрешил хост:
+   - если вариант разрешён с Category `ENFORCED_PLATFORM`, добавляется `p.dependencies.enforcedPlatform(...)`;
+   - если вариант разрешён с Category `REGULAR_PLATFORM`, добавляется `p.dependencies.platform(...)`.
+   Сохранение категории гарантирует, что у хостов с обычной `platform` версии выше BOM (из других зависимостей) не конфликтуют с согласованным разрешением, а устаревший пин из POM зависимости поднимается до версии BOM.
+
+#### Контракт хоста и зависимостей
+Версии тестовых библиотек в `testAddon_*` определяет хост (через свой `testRuntimeClasspath` или подключённый BOM). Перепубликация промежуточных зависимостей при обновлении тестовых библиотек платформы не требуется.
+
+#### Диагностика
+При конфигурации `addonTestClasspath_<dep>` выводится лог:
+`[TD-2544] addonTestClasspath_<dep>: consistent with testRuntimeClasspath, platforms=[<group>:<name>:<version>(enforced|regular),...]`
+(при отсутствии платформ `platforms=[]`).
+
 ---
 
 ## 3. Контрактное тестирование
@@ -152,5 +176,6 @@ Changelog миграций модуля Jmix обязан располагать
   - Затенение `orm.xml` при конфликте `target-entity` (TD-2521);
   - Объединение хранилищ хоста и зависимости в `jmix.core.additional-stores` (TD-2526);
   - Агрегат миграций Liquibase и порядок транзитивных модулей (TD-2533);
+  - Согласование версий тестовых библиотек с `testRuntimeClasspath` и сохранение категории платформ BOM (TD-2544, сценарии A, B, C, D, E);
   - Негативный сценарий для хостов без сущностей (нулевой регресс, TD-2521);
   - Поведение `thedevs.tests.strict` vs pre-rollout.

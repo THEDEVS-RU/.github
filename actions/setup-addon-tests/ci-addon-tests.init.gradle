@@ -6,6 +6,7 @@ import org.gradle.api.Project
 import org.gradle.api.artifacts.ProjectDependency
 import org.gradle.api.artifacts.component.ModuleComponentIdentifier
 import org.gradle.api.artifacts.component.ProjectComponentIdentifier
+import org.gradle.api.artifacts.result.ResolvedComponentResult
 import org.gradle.api.artifacts.result.ResolvedDependencyResult
 import org.gradle.api.attributes.Category
 import org.gradle.api.publish.PublishingExtension
@@ -176,6 +177,28 @@ def resolveHostMainLiquibaseChangelog(Project p) {
         return [path: relPath, file: found]
     }
     return null
+}
+
+// TD-2544: Platform category resolution (enforced, regular or null)
+def platformCategoryOf(ResolvedComponentResult comp) {
+    if (comp == null || comp.variants == null) return null
+    boolean hasRegular = false
+    for (def v : comp.variants) {
+        try {
+            def cat = v.attributes.getAttribute(Category.CATEGORY_ATTRIBUTE)
+            if (cat != null) {
+                if (cat.name == Category.ENFORCED_PLATFORM) {
+                    return 'enforced'
+                }
+                if (cat.name == Category.REGULAR_PLATFORM) {
+                    hasRegular = true
+                }
+            }
+        } catch (Exception ignored) {
+            // ignore
+        }
+    }
+    return hasRegular ? 'regular' : null
 }
 
 // 1.6. TD-2533: Module Liquibase changelogs resolution
@@ -657,6 +680,8 @@ gradle.projectsEvaluated {
 
         def runtimeClasspath = p.configurations.findByName('runtimeClasspath')
         if (runtimeClasspath == null) return
+        def testRuntimeClasspath = p.configurations.findByName('testRuntimeClasspath')
+        def consistentResolutionTarget = testRuntimeClasspath ?: runtimeClasspath
 
         def testAddonDependencies = p.tasks.maybeCreate('testAddonDependencies')
         testAddonDependencies.group = 'verification'
@@ -684,16 +709,7 @@ gradle.projectsEvaluated {
             def depName = selected.moduleVersion?.name ?: ''
             if (depName.endsWith('-test') || depName.endsWith('-app')) return
 
-            boolean isPlatform = selected.variants.any { v ->
-                try {
-                    def cat = v.attributes.getAttribute(Category.CATEGORY_ATTRIBUTE)
-                    return cat != null && (cat.name == Category.REGULAR_PLATFORM ||
-                                           cat.name == Category.ENFORCED_PLATFORM)
-                } catch (Exception ignored) {
-                    return false
-                }
-            }
-            if (isPlatform) return
+            if (platformCategoryOf(selected) != null) return
 
             def depVersion = selected.moduleVersion?.version ?: ''
 
@@ -732,6 +748,29 @@ gradle.projectsEvaluated {
             candidateAddons.add([group: baseGroup, baseModule: baseModule, version: baseVersion])
         }
 
+        // TD-2544: Collect ru.thedevs platforms from host runtimeClasspath with preserved category
+        def hostThedevsPlatforms = []
+        def seenPlatformCoords = new HashSet<String>()
+        runtimeClasspath.incoming.resolutionResult.allComponents.each { comp ->
+            if (comp.id instanceof ModuleComponentIdentifier) {
+                def mid = comp.id as ModuleComponentIdentifier
+                if (mid.group.startsWith('ru.thedevs')) {
+                    def cat = platformCategoryOf(comp)
+                    if (cat != null) {
+                        def coordKey = "${mid.group}:${mid.module}"
+                        if (seenPlatformCoords.add(coordKey)) {
+                            hostThedevsPlatforms.add([
+                                group: mid.group,
+                                name: mid.module,
+                                version: mid.version,
+                                category: cat
+                            ])
+                        }
+                    }
+                }
+            }
+        }
+
         candidateAddons.each { addon ->
             def depGroup = addon.group
             def baseModule = addon.baseModule
@@ -743,8 +782,18 @@ gradle.projectsEvaluated {
             addonTestClasspath.canBeConsumed = false
             addonTestClasspath.canBeResolved = true
             addonTestClasspath.transitive = true
-            addonTestClasspath.shouldResolveConsistentlyWith(runtimeClasspath)
+            addonTestClasspath.shouldResolveConsistentlyWith(consistentResolutionTarget)
             p.dependencies.add(confName, "${depGroup}:${baseModule}-tests:${depVersion}")
+            hostThedevsPlatforms.each { plat ->
+                if (plat.category == 'enforced') {
+                    p.dependencies.add(confName, p.dependencies.enforcedPlatform("${plat.group}:${plat.name}:${plat.version}"))
+                } else if (plat.category == 'regular') {
+                    p.dependencies.add(confName, p.dependencies.platform("${plat.group}:${plat.name}:${plat.version}"))
+                }
+            }
+
+            def formattedPlatforms = hostThedevsPlatforms.collect { "${it.group}:${it.name}:${it.version}(${it.category})" }
+            println "[TD-2544] ${confName}: consistent with ${consistentResolutionTarget.name}, platforms=[${formattedPlatforms.join(', ')}]"
 
             def testTaskName = "testAddon_${baseModule}"
             def testAddon = p.tasks.maybeCreate(testTaskName, Test)
