@@ -10,7 +10,7 @@
 
 ---
 
-## 2. setup-addon-tests: изоляция тестов зависимостей (TD-2039, TD-2499, TD-2521)
+## 2. setup-addon-tests: изоляция тестов зависимостей (TD-2039, TD-2499, TD-2521, TD-2526)
 
 Составной action `actions/setup-addon-tests` и его канонический init-скрипт `actions/setup-addon-tests/ci-addon-tests.init.gradle` реализуют архитектуру запуска тестов прямых зависимостей (`testAddon_<dep>`) в контексте хост-проекта.
 
@@ -31,6 +31,35 @@
 
 При запуске тестов зависимости классы хоста обязаны присутствовать на classpath (для проверки бинарной и метамодельной совместимости), однако автоконфигурации хоста не должны загружаться в Spring-контекст зависимости, так как они инициализируют инфраструктурные бины хоста, не относящиеся к тестам зависимости.
 Задачи `filterHostMainResources_<dep>` и `filterHostStarterResources_<dep>` копируют ресурсы хоста в каталоги `host-resources/main` и `host-resources/starter`, исключая дескриптор `META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports`.
+
+### Хранилища хоста в testAddon (TD-2526)
+
+#### Зачем нужно объединение хранилищ
+При запуске `testAddon_<dep>` Spring-контекст зависимости не импортирует конфигурацию хоста, а автоконфигурации хоста исключены (TD-2499). Поэтому `@PropertySource` хоста (в частности, `module.properties`) в контексте `testAddon_*` не применяется.
+В то же время метамодель Jmix сканирует все сущности `ru.thedevs.**` на classpath (включая сущности хоста и его зависимостей с аннотациями `@Store(name = "...")`). При назначении хранилища (`MetaModelLoader.assignStore`) Jmix проверяет наличие хранилища через `Stores.get(storeName)`. Если имя хранилища не зарегистрировано в `jmix.core.additional-stores`, контекст падает с `IllegalArgumentException: Store <name> is not registered`.
+
+#### Механизм решения (testAddon.doFirst)
+В блоке `testAddon.doFirst` вычисляется объединение имён дополнительных хранилищ (`LinkedHashSet`) из 4 источников:
+1. **Системные свойства хоста:** значение `testAddon.systemProperties['jmix.core.additional-stores']` (объявленное хостом в `tasks.withType(Test)`);
+2. **Дескриптор зависимости:** значение `thedevs.test.systemProperties.jmix.core.additional-stores` из `META-INF/thedevs-test.properties`;
+3. **Свойства-файлы зависимости:** значение `jmix.core.additional-stores` из всех `*.properties` распакованного `classesDir` (`<dep>-tests.jar`);
+4. **module.properties элементов classpath:** ключ `jmix.core.additional-stores` из файлов `module.properties` всех каталогов и jar-артефактов `testAddon.classpath` (включая `host-resources/main`, `host-resources/starter` и транзитивные библиотеки).
+
+Если объединение не пусто, выставляется одно системное свойство `jmix.core.additional-stores` (через `,`) и в лог выводится строка:
+`[TD-2526] testAddon_<dep>: jmix.core.additional-stores=<joined>`.
+Если объединение пусто, свойство не трогается.
+
+#### Контракт модуля
+Харнесс собирает имена хранилищ исключительно из `module.properties`. Каждый модуль обязан перечислять в своём `module.properties` в ключе `jmix.core.additional-stores` **все** имена дополнительных хранилищ, на которые ссылаются аннотации `@Store(name = "...")` сущностей его `src/main`.
+
+#### Что НЕ применяется и почему
+Из `module.properties` хоста извлекается **только** ключ `jmix.core.additional-stores`.
+Категорически не применяются и не копируются:
+- `jmix.core.store-descriptor-*` / `store-descriptor_*` — ссылаются на бины дескрипторов контекста хоста (например, `cryptodata_descriptor`), отсутствующие в тестовом контексте зависимости (вызывают `IllegalStateException: Store descriptor not found`);
+- `jmix.data-store.*` — специфичные для среды хоста JDBC-URL, логины и пароли;
+- Любые другие ключи (`thedevs.kafka.*`, `jmix.core.fetch-plans-config` и др.).
+
+Хост не должен объявлять `jmix.core.additional-stores` в `tasks.withType(Test)` исключительно ради `testAddon_*` — харнесс извлекает необходимые хранилища автономно по контракту модулей.
 
 ### Оверлей persistence.xml и затенение orm.xml (TD-2521)
 
@@ -81,5 +110,6 @@
   - Изоляция classpath и фильтрация `AutoConfiguration.imports` (TD-2499);
   - Формирование оверлея `persistence.xml` и объединение классов/конвертеров (TD-2521);
   - Затенение `orm.xml` при конфликте `target-entity` (TD-2521);
+  - Объединение хранилищ хоста и зависимости в `jmix.core.additional-stores` (TD-2526);
   - Негативный сценарий для хостов без сущностей (нулевой регресс, TD-2521);
   - Поведение `thedevs.tests.strict` vs pre-rollout.
