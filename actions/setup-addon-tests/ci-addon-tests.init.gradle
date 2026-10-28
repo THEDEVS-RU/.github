@@ -192,6 +192,9 @@ def normalizeLiquibasePath(String raw) {
 }
 
 def resolveModuleLiquibaseChangelogs(Project p) {
+    if (p.extensions.extraProperties.has('td2533ModuleChangelogs')) {
+        return p.extensions.extraProperties.get('td2533ModuleChangelogs')
+    }
     def runtimeClasspath = p.configurations.findByName('runtimeClasspath')
     if (runtimeClasspath == null) return []
 
@@ -212,16 +215,22 @@ def resolveModuleLiquibaseChangelogs(Project p) {
                 if (subproject != null) {
                     String prjGroup = subproject.group?.toString() ?: p.group?.toString() ?: ''
                     String prjKey = "${prjGroup}:${subproject.name}".toString()
-                    filesByComponent.computeIfAbsent(prjKey, { new ArrayList<File>() }).add(art.file)
+                    if (mvid == null || prjKey != "${mvid.group}:${mvid.name}".toString()) {
+                        filesByComponent.computeIfAbsent(prjKey, { new ArrayList<File>() }).add(art.file)
+                    }
                 }
             }
         }
     } catch (Exception e) {
-        println "::warning::[TD-2533] Could not resolve artifacts for runtimeClasspath: ${e.message}"
+        throw new GradleException("[TD-2533] Could not resolve artifacts for runtimeClasspath: ${e.message}", e)
     }
 
-    // 2. Helper to get component info and key
+    // 2. Helper to get component info and key (cached per component)
+    Map<ResolvedComponentResult, Map> compInfoCache = new IdentityHashMap<>()
     def getComponentInfo = { ResolvedComponentResult comp ->
+        if (compInfoCache.containsKey(comp)) {
+            return compInfoCache.get(comp)
+        }
         String group = comp.moduleVersion?.group ?: ''
         String name = comp.moduleVersion?.name ?: ''
         boolean isProject = (comp.id instanceof ProjectComponentIdentifier)
@@ -233,7 +242,9 @@ def resolveModuleLiquibaseChangelogs(Project p) {
         }
         String key = "${group}:${name}".toString()
         boolean matchesFilter = isProject || group.startsWith('ru.thedevs') || group.startsWith('io.jmix')
-        return [group: group, name: name, key: key, isProject: isProject, matchesFilter: matchesFilter]
+        def info = [group: group, name: name, key: key, isProject: isProject, matchesFilter: matchesFilter]
+        compInfoCache.put(comp, info)
+        return info
     }
 
     // 3. Depth-first search in post-order (dependencies before dependents)
@@ -300,6 +311,9 @@ def resolveModuleLiquibaseChangelogs(Project p) {
                     throw new GradleException("[TD-2533] Unreadable artifact directory '${rootFile.absolutePath}': ${e.message}", e)
                 }
             } else if (rootFile.isFile()) {
+                if (!rootFile.name.endsWith('.jar') && !rootFile.name.endsWith('.zip')) {
+                    continue
+                }
                 java.util.zip.ZipFile zf = null
                 try {
                     zf = new java.util.zip.ZipFile(rootFile)
@@ -333,6 +347,7 @@ def resolveModuleLiquibaseChangelogs(Project p) {
         }
     }
 
+    p.extensions.extraProperties.set('td2533ModuleChangelogs', result)
     return result
 }
 
@@ -922,24 +937,12 @@ gradle.projectsEvaluated {
                     if (depChangelog != null && !hostAlreadyIncludesDep) {
                         xmlBuilder.append("    <include file=\"${depChangelog}\" relativeToChangelogFile=\"false\"/>\n")
                     }
-                    for (def mc : moduleChangelogs) {
-                        if (mc.path == normHostChangelog) continue
-                        xmlBuilder.append("    <include file=\"/${mc.path}\" relativeToChangelogFile=\"false\"/>\n")
-                        recordedModulePaths.add("/${mc.path}".toString())
-                    }
-                } else {
-                    for (def mc : moduleChangelogs) {
-                        if (mc.path == normHostChangelog) continue
-                        if (mc.path == normDepChangelog) {
-                            if (!hostAlreadyIncludesDep) {
-                                xmlBuilder.append("    <include file=\"/${mc.path}\" relativeToChangelogFile=\"false\"/>\n")
-                                recordedModulePaths.add("/${mc.path}".toString())
-                            }
-                        } else {
-                            xmlBuilder.append("    <include file=\"/${mc.path}\" relativeToChangelogFile=\"false\"/>\n")
-                            recordedModulePaths.add("/${mc.path}".toString())
-                        }
-                    }
+                }
+
+                for (def mc : moduleChangelogs) {
+                    if (mc.path == normHostChangelog) continue
+                    xmlBuilder.append("    <include file=\"/${mc.path}\" relativeToChangelogFile=\"false\"/>\n")
+                    recordedModulePaths.add("/${mc.path}".toString())
                 }
 
                 if (hostChangelog != null) {
