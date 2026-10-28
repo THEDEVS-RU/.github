@@ -28,6 +28,9 @@ include 'itink-mod'
 include 'upstream-starter'
 include 'helper-test'
 include 'sample-lib'
+include 'transit-lib'
+include 'nested-lib'
+include 'nomodprops'
 EOF
 
 cat > "$UPSTREAM_DIR/build.gradle" <<'EOF'
@@ -306,13 +309,15 @@ EOF
 
 cat > "$UPSTREAM_DIR/itink-mod/build.gradle" <<EOF
 plugins {
-    id 'java'
+    id 'java-library'
     id 'maven-publish'
 }
 base {
     archivesName = 'itink'
 }
 dependencies {
+    api project(':nomodprops')
+    api project(':transit-lib')
     testImplementation 'org.junit.jupiter:junit-jupiter-api:5.10.2'
     testRuntimeOnly 'org.junit.jupiter:junit-jupiter-engine:5.10.2'
     testRuntimeOnly 'org.junit.platform:junit-platform-launcher:1.10.2'
@@ -433,11 +438,135 @@ publishing {
 }
 EOF
 
+# TD-2533 upstream fixtures: nested-lib, transit-lib, nomodprops
+mkdir -p "$UPSTREAM_DIR/nested-lib/src/main/resources/ru/thedevs/nested/liquibase"
+cat > "$UPSTREAM_DIR/nested-lib/src/main/resources/ru/thedevs/nested/liquibase/changelog.xml" <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog
+    xmlns="http://www.liquibase.org/xml/ns/dbchangelog"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog
+        http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-latest.xsd">
+    <changeSet id="1-nested" author="thedevs">
+        <createTable tableName="NESTED_TABLE">
+            <column name="ID" type="${uuid.type}">
+                <constraints primaryKey="true" nullable="false"/>
+            </column>
+        </createTable>
+    </changeSet>
+</databaseChangeLog>
+EOF
+
+cat > "$UPSTREAM_DIR/nested-lib/build.gradle" <<EOF
+plugins {
+    id 'java-library'
+    id 'maven-publish'
+}
+publishing {
+    publications {
+        javaMaven(MavenPublication) {
+            from components.java
+        }
+    }
+    repositories {
+        maven {
+            name = 'localRepo'
+            url = uri("${REPO_DIR}")
+        }
+    }
+}
+EOF
+
+mkdir -p "$UPSTREAM_DIR/transit-lib/src/main/resources/ru/thedevs/transit/liquibase"
+cat > "$UPSTREAM_DIR/transit-lib/src/main/resources/ru/thedevs/transit/liquibase/changelog.xml" <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog
+    xmlns="http://www.liquibase.org/xml/ns/dbchangelog"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog
+        http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-latest.xsd">
+    <property name="uuid.type" dbms="oracle" value="varchar2(32)"/>
+    <property name="uuid.type" dbms="!oracle" value="uuid"/>
+    <include file="/ru/thedevs/nested/liquibase/changelog.xml" contextFilter="@jmix-addon"/>
+    <changeSet id="1-transit" author="thedevs">
+        <createTable tableName="TRANSIT_TABLE">
+            <column name="ID" type="${uuid.type}">
+                <constraints primaryKey="true" nullable="false"/>
+            </column>
+        </createTable>
+    </changeSet>
+</databaseChangeLog>
+EOF
+
+cat > "$UPSTREAM_DIR/transit-lib/build.gradle" <<EOF
+plugins {
+    id 'java-library'
+    id 'maven-publish'
+}
+dependencies {
+    api project(':nested-lib')
+}
+publishing {
+    publications {
+        javaMaven(MavenPublication) {
+            from components.java
+        }
+    }
+    repositories {
+        maven {
+            name = 'localRepo'
+            url = uri("${REPO_DIR}")
+        }
+    }
+}
+EOF
+
+mkdir -p "$UPSTREAM_DIR/nomodprops/src/main/resources/ru/thedevs/nomodprops/liquibase"
+cat > "$UPSTREAM_DIR/nomodprops/src/main/resources/ru/thedevs/nomodprops/liquibase/changelog.xml" <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog
+    xmlns="http://www.liquibase.org/xml/ns/dbchangelog"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog
+        http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-latest.xsd">
+    <changeSet id="1-nomodprops" author="thedevs">
+        <createTable tableName="NOMODPROPS_TABLE">
+            <column name="ID" type="${uuid.type}">
+                <constraints primaryKey="true" nullable="false"/>
+            </column>
+        </createTable>
+    </changeSet>
+</databaseChangeLog>
+EOF
+
+cat > "$UPSTREAM_DIR/nomodprops/build.gradle" <<EOF
+plugins {
+    id 'java-library'
+    id 'maven-publish'
+}
+dependencies {
+    api project(':transit-lib')
+}
+publishing {
+    publications {
+        javaMaven(MavenPublication) {
+            from components.java
+        }
+    }
+    repositories {
+        maven {
+            name = 'localRepo'
+            url = uri("${REPO_DIR}")
+        }
+    }
+}
+EOF
+
 echo "Building and publishing upstream fixtures via ci-addon-tests.init.gradle..."
 (
   cd "$UPSTREAM_DIR"
-  # Publish itink-mod, upstream-starter, helper-test via ci-addon-tests.init.gradle
-  gradle -I "$INIT_SCRIPT" :itink-mod:publishAllPublicationsToLocalRepoRepository :upstream-starter:publishAllPublicationsToLocalRepoRepository :helper-test:publishAllPublicationsToLocalRepoRepository --no-daemon
+  # Publish itink-mod, upstream-starter, helper-test, transit-lib, nested-lib, nomodprops via ci-addon-tests.init.gradle
+  gradle -I "$INIT_SCRIPT" :nested-lib:publishAllPublicationsToLocalRepoRepository :transit-lib:publishAllPublicationsToLocalRepoRepository :nomodprops:publishAllPublicationsToLocalRepoRepository :itink-mod:publishAllPublicationsToLocalRepoRepository :upstream-starter:publishAllPublicationsToLocalRepoRepository :helper-test:publishAllPublicationsToLocalRepoRepository --no-daemon
   # Publish sample-lib WITHOUT init script so it has NO -tests artifact published
   gradle :sample-lib:publishAllPublicationsToLocalRepoRepository --no-daemon
 )
@@ -730,6 +859,62 @@ fi
 
 if ! grep -q "ru/thedevs/consumer/liquibase/changelog.xml" "$AGGREGATE_CHANGELOG"; then
   echo "FAIL: Aggregate changelog missing host changelog" >&2
+  exit 1
+fi
+
+# TD-2533: Module Liquibase changelogs in aggregate
+for inc in "/ru/thedevs/transit/liquibase/changelog.xml" "/ru/thedevs/nested/liquibase/changelog.xml" "/ru/thedevs/nomodprops/liquibase/changelog.xml"; do
+  count=$(grep -c "file=\"$inc\"" "$AGGREGATE_CHANGELOG" || true)
+  if [ "$count" -ne 1 ]; then
+    echo "FAIL: Expected $inc to appear exactly once in $AGGREGATE_CHANGELOG, found $count times" >&2
+    exit 1
+  fi
+done
+
+line_itink=$(grep -n "ru/thedevs/itink/liquibase/changelog.xml" "$AGGREGATE_CHANGELOG" | cut -d: -f1 | head -1)
+line_nested=$(grep -n "ru/thedevs/nested/liquibase/changelog.xml" "$AGGREGATE_CHANGELOG" | cut -d: -f1 | head -1)
+line_transit=$(grep -n "ru/thedevs/transit/liquibase/changelog.xml" "$AGGREGATE_CHANGELOG" | cut -d: -f1 | head -1)
+line_nomodprops=$(grep -n "ru/thedevs/nomodprops/liquibase/changelog.xml" "$AGGREGATE_CHANGELOG" | cut -d: -f1 | head -1)
+line_consumer=$(grep -n "ru/thedevs/consumer/liquibase/changelog.xml" "$AGGREGATE_CHANGELOG" | cut -d: -f1 | head -1)
+
+if [ "$line_nested" -ge "$line_transit" ]; then
+  echo "FAIL: nested (line $line_nested) must appear before transit (line $line_transit)" >&2
+  exit 1
+fi
+if [ "$line_transit" -ge "$line_nomodprops" ]; then
+  echo "FAIL: transit (line $line_transit) must appear before nomodprops (line $line_nomodprops)" >&2
+  exit 1
+fi
+if [ "$line_itink" -ge "$line_transit" ]; then
+  echo "FAIL: itink (line $line_itink) must appear before transit (line $line_transit)" >&2
+  exit 1
+fi
+if [ "$line_nomodprops" -ge "$line_consumer" ]; then
+  echo "FAIL: nomodprops (line $line_nomodprops) must appear before host changelog consumer (line $line_consumer)" >&2
+  exit 1
+fi
+
+if ! grep -q '<property name="uuid.type" dbms="oracle" value="varchar2(32)"/>' "$AGGREGATE_CHANGELOG"; then
+  echo "FAIL: Aggregate changelog missing uuid.type property for oracle" >&2
+  exit 1
+fi
+if ! grep -q '<property name="uuid.type" dbms="!oracle" value="uuid"/>' "$AGGREGATE_CHANGELOG"; then
+  echo "FAIL: Aggregate changelog missing uuid.type property for !oracle" >&2
+  exit 1
+fi
+
+line_uuid=$(grep -n 'property name="uuid.type"' "$AGGREGATE_CHANGELOG" | cut -d: -f1 | head -1)
+if [ "$line_uuid" -ge "$line_itink" ] || [ "$line_uuid" -ge "$line_nested" ]; then
+  echo "FAIL: uuid.type properties must appear at the beginning before changelog includes" >&2
+  exit 1
+fi
+
+if ! grep -q "\[TD-2533\] aggregate-changelog for 'itink'" "$DOWNSTREAM_LOG"; then
+  echo "FAIL: Expected '[TD-2533] aggregate-changelog for '\''itink'\''' in $DOWNSTREAM_LOG" >&2
+  exit 1
+fi
+if ! grep -q "\[TD-2533\] testAddon_itink: liquibase.allowDuplicatedChangesetIdentifiers=true" "$DOWNSTREAM_LOG"; then
+  echo "FAIL: Expected '[TD-2533] testAddon_itink: liquibase.allowDuplicatedChangesetIdentifiers=true' in $DOWNSTREAM_LOG" >&2
   exit 1
 fi
 
