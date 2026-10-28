@@ -122,6 +122,7 @@ import java.util.stream.Collectors;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class ItinkTest {
@@ -181,6 +182,34 @@ public class ItinkTest {
         assertEquals("ru.thedevs.itink.CustomExcludedAutoConfiguration",
                 System.getProperty("spring.autoconfigure.exclude"),
                 "Dependency spring.autoconfigure.exclude system property must be preserved");
+
+        // TD-2526: Verify jmix.core.additional-stores merging from host and dependency
+        String additionalStores = System.getProperty("jmix.core.additional-stores");
+        assertNotNull(additionalStores, "jmix.core.additional-stores must be set");
+        List<String> parsedStores = java.util.Arrays.stream(additionalStores.split(","))
+                .map(String::trim)
+                .filter(s -> !s.isEmpty())
+                .collect(Collectors.toList());
+        if (expectHostEntities) {
+            assertEquals(java.util.Set.of("hostsys", "itinkprop", "itinkfile", "consumerdata", "starterdata"),
+                    new java.util.HashSet<>(parsedStores),
+                    "jmix.core.additional-stores must contain all host and dependency stores without losing any");
+            assertEquals(5, parsedStores.size(),
+                    "jmix.core.additional-stores must not contain duplicate stores: " + additionalStores);
+        } else {
+            assertEquals(java.util.Set.of("itinkprop", "itinkfile"),
+                    new java.util.HashSet<>(parsedStores),
+                    "In negative scenario, jmix.core.additional-stores must contain only dependency stores");
+            assertEquals(2, parsedStores.size(),
+                    "jmix.core.additional-stores must not contain duplicates: " + additionalStores);
+        }
+
+        assertNull(System.getProperty("jmix.core.store-descriptor-consumerdata"),
+                "jmix.core.store-descriptor-consumerdata must not leak from module.properties");
+        assertNull(System.getProperty("jmix.data-store.consumerdata.jdbc-url"),
+                "jmix.data-store.consumerdata.jdbc-url must not leak from module.properties");
+        assertNull(System.getProperty("thedevs.fixture.leak"),
+                "thedevs.fixture.leak must not leak from module.properties");
 
         // TD-2521: Persistence Unit Overlay & Orm.xml Shadowing checks
         URL puUrl = getClass().getClassLoader().getResource("ru/thedevs/itink/persistence.xml");
@@ -267,6 +296,7 @@ EOF
 mkdir -p "$UPSTREAM_DIR/itink-mod/src/test/resources"
 cat > "$UPSTREAM_DIR/itink-mod/src/test/resources/test-itink.properties" <<'EOF'
 main.liquibase.change-log=ru/thedevs/itink/liquibase/changelog.xml
+jmix.core.additional-stores=itinkfile
 EOF
 
 cat > "$UPSTREAM_DIR/itink-mod/build.gradle" <<EOF
@@ -287,6 +317,7 @@ dependencies {
 }
 test {
     systemProperty 'spring.autoconfigure.exclude', 'ru.thedevs.itink.CustomExcludedAutoConfiguration'
+    systemProperty 'jmix.core.additional-stores', 'itinkprop'
 }
 publishing {
     publications {
@@ -484,6 +515,11 @@ if ! echo "$TEST_PROPS" | grep -q "thedevs.test.systemProperties.spring.autoconf
   exit 1
 fi
 
+if ! echo "$TEST_PROPS" | grep -q "thedevs.test.systemProperties.jmix.core.additional-stores=itinkprop"; then
+  echo "FAIL: thedevs.test.systemProperties.jmix.core.additional-stores not found or incorrect in $TEST_PROPS_FILE" >&2
+  exit 1
+fi
+
 echo "Published upstream artifacts and POM validation: PASSED"
 
 # 3. Downstream Fixture Setup
@@ -561,6 +597,14 @@ cat > "$DOWNSTREAM_DIR/consumer-mod/src/main/resources/ru/thedevs/consumer/liqui
 </databaseChangeLog>
 EOF
 
+# Host module.properties (TD-2526)
+cat > "$DOWNSTREAM_DIR/consumer-mod/src/main/resources/ru/thedevs/consumer/module.properties" <<'EOF'
+jmix.core.additional-stores=consumerdata
+jmix.core.store-descriptor-consumerdata=consumer_descriptor
+jmix.data-store.consumerdata.jdbc-url=jdbc:fixture://unreachable
+thedevs.fixture.leak=must-not-apply
+EOF
+
 cat > "$DOWNSTREAM_DIR/consumer-mod/build.gradle" <<'EOF'
 plugins {
     id 'java'
@@ -571,6 +615,9 @@ dependencies {
     testImplementation 'org.junit.jupiter:junit-jupiter-api:5.10.2'
     testRuntimeOnly 'org.junit.jupiter:junit-jupiter-engine:5.10.2'
     testRuntimeOnly 'org.junit.platform:junit-platform-launcher:1.10.2'
+}
+tasks.withType(Test).configureEach {
+    systemProperty 'jmix.core.additional-stores', 'hostsys'
 }
 // Emulate Jmix plugin mutating configurations in afterEvaluate
 project.afterEvaluate {
@@ -629,6 +676,10 @@ public class ConsumerAutoConfiguration {
 EOF
 
 mkdir -p "$DOWNSTREAM_DIR/consumer-starter/src/main/resources/ru/thedevs/consumer/starter"
+cat > "$DOWNSTREAM_DIR/consumer-starter/src/main/resources/ru/thedevs/consumer/starter/module.properties" <<'EOF'
+jmix.core.additional-stores=starterdata
+EOF
+
 cat > "$DOWNSTREAM_DIR/consumer-starter/src/main/resources/ru/thedevs/consumer/starter/starter-resource.txt" <<'EOF'
 starter-ok
 EOF
@@ -723,6 +774,11 @@ fi
 
 if ! grep -q -- "(-1 entity entries superseded by host)" "$DOWNSTREAM_LOG"; then
   echo "FAIL: Gradle log missing '(-1 entity entries superseded by host)'" >&2
+  exit 1
+fi
+
+if ! grep -q '\[TD-2526\] testAddon_itink: jmix.core.additional-stores=' "$DOWNSTREAM_LOG"; then
+  echo "FAIL: Expected [TD-2526] testAddon_itink: jmix.core.additional-stores= not found in downstream log" >&2
   exit 1
 fi
 

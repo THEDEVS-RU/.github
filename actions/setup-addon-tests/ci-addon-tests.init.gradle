@@ -178,6 +178,93 @@ def resolveHostMainLiquibaseChangelog(Project p) {
     return null
 }
 
+// 1.5. TD-2526: Host and dependency store names resolution
+def parseStoreNames(Object rawValue) {
+    if (rawValue == null) return []
+    def str = rawValue.toString().trim()
+    if (str.isEmpty()) return []
+    if (str.contains('${')) {
+        return [str]
+    }
+    return str.split(',').collect { it.trim() }.findAll { !it.isEmpty() }
+}
+
+def collectStoreNamesFromClasspathModuleProperties(Iterable<File> classpathFiles) {
+    Set<String> names = new LinkedHashSet<>()
+    if (classpathFiles == null) return names
+    for (File f : classpathFiles) {
+        if (f == null || !f.exists()) continue
+        if (f.isDirectory()) {
+            f.eachFileRecurse { child ->
+                if (child.isFile() && child.name == 'module.properties') {
+                    try {
+                        def props = new Properties()
+                        child.withInputStream { props.load(it) }
+                        def val = props.getProperty('jmix.core.additional-stores')
+                        if (val != null) {
+                            names.addAll(parseStoreNames(val))
+                        }
+                    } catch (Exception e) {
+                        println "::warning::[TD-2526] Failed to read module.properties from ${child.absolutePath}: ${e.message}"
+                    }
+                }
+            }
+        } else if (f.isFile() && (f.name.endsWith('.jar') || f.name.endsWith('.zip'))) {
+            java.util.zip.ZipFile zip = null
+            try {
+                zip = new java.util.zip.ZipFile(f)
+                def entries = zip.entries()
+                while (entries.hasMoreElements()) {
+                    def entry = entries.nextElement()
+                    if (!entry.isDirectory() && (entry.name == 'module.properties' || entry.name.endsWith('/module.properties'))) {
+                        try {
+                            zip.getInputStream(entry).withStream { is ->
+                                def props = new Properties()
+                                props.load(is)
+                                def val = props.getProperty('jmix.core.additional-stores')
+                                if (val != null) {
+                                    names.addAll(parseStoreNames(val))
+                                }
+                            }
+                        } catch (Exception e) {
+                            println "::warning::[TD-2526] Failed to read ${entry.name} from ${f.absolutePath}: ${e.message}"
+                        }
+                    }
+                }
+            } catch (Exception e) {
+                println "::warning::[TD-2526] Failed to inspect archive ${f.absolutePath}: ${e.message}"
+            } finally {
+                if (zip != null) {
+                    try { zip.close() } catch (Exception ignored) {}
+                }
+            }
+        }
+    }
+    return names
+}
+
+def collectStoreNamesFromDependencyProperties(File classesDir) {
+    Set<String> names = new LinkedHashSet<>()
+    if (classesDir == null || !classesDir.exists() || !classesDir.isDirectory()) {
+        return names
+    }
+    classesDir.eachFileRecurse { f ->
+        if (f.isFile() && f.name.endsWith('.properties')) {
+            try {
+                def props = new Properties()
+                f.withInputStream { props.load(it) }
+                def val = props.getProperty('jmix.core.additional-stores')
+                if (val != null) {
+                    names.addAll(parseStoreNames(val))
+                }
+            } catch (Exception e) {
+                println "::warning::[TD-2526] Failed to read properties file ${f.absolutePath}: ${e.message}"
+            }
+        }
+    }
+    return names
+}
+
 // 2.1. Isolated publication javaMavenTests (<artifactId>-tests)
 gradle.allprojects { p ->
     p.pluginManager.withPlugin('maven-publish') {
@@ -1078,6 +1165,9 @@ gradle.projectsEvaluated {
                     return
                 }
 
+                def initialHostAdditionalStores = testAddon.systemProperties['jmix.core.additional-stores']
+                def depDescriptorAdditionalStores = null
+
                 def propFile = new File(classesDir, "META-INF/thedevs-test.properties")
                 if (propFile.exists()) {
                     def depProps = new Properties()
@@ -1086,8 +1176,23 @@ gradle.projectsEvaluated {
                         if (k.startsWith('thedevs.test.systemProperties.')) {
                             def sysProp = k.substring('thedevs.test.systemProperties.'.length())
                             testAddon.systemProperty(sysProp, v)
+                            if (sysProp == 'jmix.core.additional-stores') {
+                                depDescriptorAdditionalStores = v
+                            }
                         }
                     }
+                }
+
+                Set<String> allStores = new LinkedHashSet<>()
+                allStores.addAll(parseStoreNames(initialHostAdditionalStores))
+                allStores.addAll(parseStoreNames(depDescriptorAdditionalStores))
+                allStores.addAll(collectStoreNamesFromDependencyProperties(classesDir))
+                allStores.addAll(collectStoreNamesFromClasspathModuleProperties(testAddon.classpath.files))
+
+                if (!allStores.isEmpty()) {
+                    def joined = allStores.join(',')
+                    testAddon.systemProperty('jmix.core.additional-stores', joined)
+                    println "[TD-2526] testAddon_${baseModule}: jmix.core.additional-stores=${joined}"
                 }
 
                 testAddon.systemProperty('main.liquibase.change-log', 'classpath:aggregate-changelog.xml')
