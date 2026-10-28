@@ -31,6 +31,7 @@ include 'sample-lib'
 include 'transit-lib'
 include 'nested-lib'
 include 'nomodprops'
+include 'topodep-mod'
 EOF
 
 cat > "$UPSTREAM_DIR/build.gradle" <<'EOF'
@@ -562,11 +563,69 @@ publishing {
 }
 EOF
 
+# TD-2533 upstream fixture: topodep-mod (covers depMatchesModule=true and hostAlreadyIncludesDep=true)
+mkdir -p "$UPSTREAM_DIR/topodep-mod/src/main/java/ru/thedevs/topodep"
+cat > "$UPSTREAM_DIR/topodep-mod/src/main/java/ru/thedevs/topodep/TopodepService.java" <<'EOF'
+package ru.thedevs.topodep;
+public class TopodepService {
+    public String message() { return "hello from topodep"; }
+}
+EOF
+
+mkdir -p "$UPSTREAM_DIR/topodep-mod/src/test/java/ru/thedevs/topodep"
+cat > "$UPSTREAM_DIR/topodep-mod/src/test/java/ru/thedevs/topodep/TopodepTest.java" <<'EOF'
+package ru.thedevs.topodep;
+import org.junit.jupiter.api.Test;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+
+public class TopodepTest {
+    @Test
+    void testTopodepService() {
+        assertEquals("hello from topodep", new TopodepService().message());
+    }
+}
+EOF
+
+mkdir -p "$UPSTREAM_DIR/topodep-mod/src/test/resources"
+cat > "$UPSTREAM_DIR/topodep-mod/src/test/resources/test-topodep.properties" <<'EOF'
+main.liquibase.change-log=ru/thedevs/transit/liquibase/changelog.xml
+EOF
+
+cat > "$UPSTREAM_DIR/topodep-mod/build.gradle" <<EOF
+plugins {
+    id 'java-library'
+    id 'maven-publish'
+}
+base {
+    archivesName = 'topodep'
+}
+dependencies {
+    api project(':transit-lib')
+    testImplementation 'org.junit.jupiter:junit-jupiter-api:5.10.2'
+    testRuntimeOnly 'org.junit.jupiter:junit-jupiter-engine:5.10.2'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher:1.10.2'
+}
+publishing {
+    publications {
+        javaMaven(MavenPublication) {
+            artifactId = base.archivesName.get()
+            from components.java
+        }
+    }
+    repositories {
+        maven {
+            name = 'localRepo'
+            url = uri("${REPO_DIR}")
+        }
+    }
+}
+EOF
+
 echo "Building and publishing upstream fixtures via ci-addon-tests.init.gradle..."
 (
   cd "$UPSTREAM_DIR"
-  # Publish itink-mod, upstream-starter, helper-test, transit-lib, nested-lib, nomodprops via ci-addon-tests.init.gradle
-  gradle -I "$INIT_SCRIPT" :nested-lib:publishAllPublicationsToLocalRepoRepository :transit-lib:publishAllPublicationsToLocalRepoRepository :nomodprops:publishAllPublicationsToLocalRepoRepository :itink-mod:publishAllPublicationsToLocalRepoRepository :upstream-starter:publishAllPublicationsToLocalRepoRepository :helper-test:publishAllPublicationsToLocalRepoRepository --no-daemon
+  # Publish itink-mod, upstream-starter, helper-test, transit-lib, nested-lib, nomodprops, topodep-mod via ci-addon-tests.init.gradle
+  gradle -I "$INIT_SCRIPT" :nested-lib:publishAllPublicationsToLocalRepoRepository :transit-lib:publishAllPublicationsToLocalRepoRepository :nomodprops:publishAllPublicationsToLocalRepoRepository :topodep-mod:publishAllPublicationsToLocalRepoRepository :itink-mod:publishAllPublicationsToLocalRepoRepository :upstream-starter:publishAllPublicationsToLocalRepoRepository :helper-test:publishAllPublicationsToLocalRepoRepository --no-daemon
   # Publish sample-lib WITHOUT init script so it has NO -tests artifact published
   gradle :sample-lib:publishAllPublicationsToLocalRepoRepository --no-daemon
 )
@@ -727,6 +786,7 @@ public class ConsumerTest {
 EOF
 
 # Host changelog in main resources (not test resources!)
+# Includes transit-lib changelog to emulate real hosts (addon-balance, addon-core-gps, etc.) including core changelog
 mkdir -p "$DOWNSTREAM_DIR/consumer-mod/src/main/resources/ru/thedevs/consumer/liquibase"
 cat > "$DOWNSTREAM_DIR/consumer-mod/src/main/resources/ru/thedevs/consumer/liquibase/changelog.xml" <<'EOF'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -735,6 +795,7 @@ cat > "$DOWNSTREAM_DIR/consumer-mod/src/main/resources/ru/thedevs/consumer/liqui
     xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
     xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog
         http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-latest.xsd">
+    <include file="/ru/thedevs/transit/liquibase/changelog.xml" relativeToChangelogFile="false"/>
 </databaseChangeLog>
 EOF
 
@@ -753,6 +814,7 @@ plugins {
 }
 dependencies {
     implementation 'ru.thedevs:upstream-starter:1.0.0'
+    implementation 'ru.thedevs:topodep:1.0.0'
     testImplementation 'org.junit.jupiter:junit-jupiter-api:5.10.2'
     testRuntimeOnly 'org.junit.jupiter:junit-jupiter-engine:5.10.2'
     testRuntimeOnly 'org.junit.platform:junit-platform-launcher:1.10.2'
@@ -915,6 +977,54 @@ if ! grep -q "\[TD-2533\] aggregate-changelog for 'itink'" "$DOWNSTREAM_LOG"; th
 fi
 if ! grep -q "\[TD-2533\] testAddon_itink: liquibase.allowDuplicatedChangesetIdentifiers=true" "$DOWNSTREAM_LOG"; then
   echo "FAIL: Expected '[TD-2533] testAddon_itink: liquibase.allowDuplicatedChangesetIdentifiers=true' in $DOWNSTREAM_LOG" >&2
+  exit 1
+fi
+
+# TD-2533: Validate topodep aggregate (depMatchesModule=true and hostAlreadyIncludesDep=true scenario)
+TOPO_AGGREGATE="$DOWNSTREAM_DIR/consumer-mod/build/addon-tests/topodep/aggregate-changelog.xml"
+if [ ! -f "$TOPO_AGGREGATE" ]; then
+  echo "FAIL: Aggregate changelog was not created at $TOPO_AGGREGATE" >&2
+  exit 1
+fi
+
+topo_line_nested=$(grep -n "ru/thedevs/nested/liquibase/changelog.xml" "$TOPO_AGGREGATE" | cut -d: -f1 | head -1)
+topo_line_transit=$(grep -n "ru/thedevs/transit/liquibase/changelog.xml" "$TOPO_AGGREGATE" | cut -d: -f1 | head -1)
+topo_line_nomodprops=$(grep -n "ru/thedevs/nomodprops/liquibase/changelog.xml" "$TOPO_AGGREGATE" | cut -d: -f1 | head -1)
+topo_line_consumer=$(grep -n "ru/thedevs/consumer/liquibase/changelog.xml" "$TOPO_AGGREGATE" | cut -d: -f1 | head -1)
+
+# Check transit appears in module includes exactly once (plus once inside host changelog)
+topo_count_transit=$(grep -c 'file="/ru/thedevs/transit/liquibase/changelog.xml"' "$TOPO_AGGREGATE" || true)
+if [ "$topo_count_transit" -ne 1 ]; then
+  echo "FAIL: Expected /ru/thedevs/transit/liquibase/changelog.xml to appear exactly once in $TOPO_AGGREGATE module includes, found $topo_count_transit times" >&2
+  exit 1
+fi
+
+if [ "$topo_line_nested" -ge "$topo_line_transit" ]; then
+  echo "FAIL: topodep aggregate: nested (line $topo_line_nested) must appear before transit (line $topo_line_transit)" >&2
+  exit 1
+fi
+
+if [ "$topo_line_transit" -ge "$topo_line_nomodprops" ]; then
+  echo "FAIL: topodep aggregate: transit (line $topo_line_transit) must appear before nomodprops (line $topo_line_nomodprops)" >&2
+  exit 1
+fi
+
+if [ "$topo_line_nomodprops" -ge "$topo_line_consumer" ]; then
+  echo "FAIL: topodep aggregate: nomodprops (line $topo_line_nomodprops) must appear before host changelog consumer (line $topo_line_consumer)" >&2
+  exit 1
+fi
+
+if ! grep -q "ru/thedevs/consumer/liquibase/changelog.xml" "$TOPO_AGGREGATE"; then
+  echo "FAIL: topodep aggregate missing host changelog" >&2
+  exit 1
+fi
+
+if ! grep -q "\[TD-2533\] aggregate-changelog for 'topodep': dep changelog position=topological" "$DOWNSTREAM_LOG"; then
+  echo "FAIL: Expected '[TD-2533] aggregate-changelog for '\''topodep'\'': dep changelog position=topological' in $DOWNSTREAM_LOG" >&2
+  exit 1
+fi
+if ! grep -q "\[TD-2533\] testAddon_topodep: liquibase.allowDuplicatedChangesetIdentifiers=true" "$DOWNSTREAM_LOG"; then
+  echo "FAIL: Expected '[TD-2533] testAddon_topodep: liquibase.allowDuplicatedChangesetIdentifiers=true' in $DOWNSTREAM_LOG" >&2
   exit 1
 fi
 
