@@ -32,6 +32,7 @@ include 'transit-lib'
 include 'nested-lib'
 include 'nomodprops'
 include 'topodep-mod'
+include 'managed-lib'
 EOF
 
 cat > "$UPSTREAM_DIR/build.gradle" <<'EOF'
@@ -325,6 +326,7 @@ dependencies {
     testImplementation(dependencies.create(project(':helper-test')) {
         exclude group: 'org.slf4j', module: 'slf4j-api'
     })
+    testImplementation project(':managed-lib')
 }
 test {
     systemProperty 'spring.autoconfigure.exclude', 'ru.thedevs.itink.CustomExcludedAutoConfiguration'
@@ -420,6 +422,28 @@ public class Sample {
 EOF
 
 cat > "$UPSTREAM_DIR/sample-lib/build.gradle" <<EOF
+plugins {
+    id 'java'
+    id 'maven-publish'
+}
+publishing {
+    publications {
+        javaMaven(MavenPublication) {
+            from components.java
+        }
+    }
+    repositories {
+        maven {
+            name = 'localRepo'
+            url = uri("${REPO_DIR}")
+        }
+    }
+}
+EOF
+
+# TD-2544: managed-lib fixture (version 1.0.0 in upstream)
+mkdir -p "$UPSTREAM_DIR/managed-lib"
+cat > "$UPSTREAM_DIR/managed-lib/build.gradle" <<EOF
 plugins {
     id 'java'
     id 'maven-publish'
@@ -624,11 +648,141 @@ EOF
 echo "Building and publishing upstream fixtures via ci-addon-tests.init.gradle..."
 (
   cd "$UPSTREAM_DIR"
-  # Publish itink-mod, upstream-starter, helper-test, transit-lib, nested-lib, nomodprops, topodep-mod via ci-addon-tests.init.gradle
-  gradle -I "$INIT_SCRIPT" :nested-lib:publishAllPublicationsToLocalRepoRepository :transit-lib:publishAllPublicationsToLocalRepoRepository :nomodprops:publishAllPublicationsToLocalRepoRepository :topodep-mod:publishAllPublicationsToLocalRepoRepository :itink-mod:publishAllPublicationsToLocalRepoRepository :upstream-starter:publishAllPublicationsToLocalRepoRepository :helper-test:publishAllPublicationsToLocalRepoRepository --no-daemon
+  # Publish itink-mod, upstream-starter, helper-test, transit-lib, nested-lib, nomodprops, topodep-mod, managed-lib via ci-addon-tests.init.gradle
+  gradle -I "$INIT_SCRIPT" :nested-lib:publishAllPublicationsToLocalRepoRepository :transit-lib:publishAllPublicationsToLocalRepoRepository :nomodprops:publishAllPublicationsToLocalRepoRepository :topodep-mod:publishAllPublicationsToLocalRepoRepository :managed-lib:publishAllPublicationsToLocalRepoRepository :itink-mod:publishAllPublicationsToLocalRepoRepository :upstream-starter:publishAllPublicationsToLocalRepoRepository :helper-test:publishAllPublicationsToLocalRepoRepository --no-daemon
   # Publish sample-lib WITHOUT init script so it has NO -tests artifact published
   gradle :sample-lib:publishAllPublicationsToLocalRepoRepository --no-daemon
 )
+
+# TD-2544 fixtures: helper-test:1.1.0, managed-lib:1.2.0, needs-managed:1.0.0, fixture-bom:1.0.0
+echo "Publishing TD-2544 fixtures to local repo..."
+HELPER_V11_DIR="$TEST_DIR/helper-v11"
+mkdir -p "$HELPER_V11_DIR"
+cat > "$HELPER_V11_DIR/settings.gradle" <<'EOF'
+rootProject.name = 'helper-test'
+EOF
+cat > "$HELPER_V11_DIR/build.gradle" <<EOF
+plugins {
+    id 'java'
+    id 'maven-publish'
+}
+group = 'ru.thedevs'
+version = '1.1.0'
+publishing {
+    publications {
+        javaMaven(MavenPublication) {
+            from components.java
+        }
+    }
+    repositories {
+        maven {
+            name = 'localRepo'
+            url = uri("${REPO_DIR}")
+        }
+    }
+}
+EOF
+(cd "$HELPER_V11_DIR" && gradle publishAllPublicationsToLocalRepoRepository --no-daemon)
+
+MANAGED_V12_DIR="$TEST_DIR/managed-v12"
+mkdir -p "$MANAGED_V12_DIR"
+cat > "$MANAGED_V12_DIR/settings.gradle" <<'EOF'
+rootProject.name = 'managed-lib'
+EOF
+cat > "$MANAGED_V12_DIR/build.gradle" <<EOF
+plugins {
+    id 'java'
+    id 'maven-publish'
+}
+group = 'ru.thedevs'
+version = '1.2.0'
+publishing {
+    publications {
+        javaMaven(MavenPublication) {
+            from components.java
+        }
+    }
+    repositories {
+        maven {
+            name = 'localRepo'
+            url = uri("${REPO_DIR}")
+        }
+    }
+}
+EOF
+(cd "$MANAGED_V12_DIR" && gradle publishAllPublicationsToLocalRepoRepository --no-daemon)
+
+NEEDS_MANAGED_DIR="$TEST_DIR/needs-managed"
+mkdir -p "$NEEDS_MANAGED_DIR"
+cat > "$NEEDS_MANAGED_DIR/settings.gradle" <<'EOF'
+rootProject.name = 'needs-managed'
+EOF
+cat > "$NEEDS_MANAGED_DIR/build.gradle" <<EOF
+plugins {
+    id 'java'
+    id 'maven-publish'
+}
+group = 'ru.thedevs'
+version = '1.0.0'
+repositories {
+    maven { url = uri("${REPO_DIR}") }
+    mavenCentral()
+}
+dependencies {
+    implementation 'ru.thedevs:managed-lib:1.2.0'
+}
+publishing {
+    publications {
+        javaMaven(MavenPublication) {
+            from components.java
+        }
+    }
+    repositories {
+        maven {
+            name = 'localRepo'
+            url = uri("${REPO_DIR}")
+        }
+    }
+}
+EOF
+(cd "$NEEDS_MANAGED_DIR" && gradle publishAllPublicationsToLocalRepoRepository --no-daemon)
+
+FIXTURE_BOM_DIR="$TEST_DIR/fixture-bom"
+mkdir -p "$FIXTURE_BOM_DIR"
+cat > "$FIXTURE_BOM_DIR/settings.gradle" <<'EOF'
+rootProject.name = 'fixture-bom'
+EOF
+cat > "$FIXTURE_BOM_DIR/build.gradle" <<EOF
+plugins {
+    id 'java-platform'
+    id 'maven-publish'
+}
+group = 'ru.thedevs'
+version = '1.0.0'
+javaPlatform {
+    allowDependencies()
+}
+dependencies {
+    constraints {
+        api 'ru.thedevs:helper-test:1.1.0'
+        api 'ru.thedevs:managed-lib:1.0.0'
+    }
+}
+publishing {
+    publications {
+        javaMaven(MavenPublication) {
+            from components.javaPlatform
+        }
+    }
+    repositories {
+        maven {
+            name = 'localRepo'
+            url = uri("${REPO_DIR}")
+        }
+    }
+}
+EOF
+(cd "$FIXTURE_BOM_DIR" && gradle publishAllPublicationsToLocalRepoRepository --no-daemon)
 
 # 2. Validate Published Artifacts and POM
 echo "Validating published upstream artifacts..."
@@ -670,6 +824,12 @@ fi
 # Must contain dependency on helper-test with runtime scope
 if ! echo "$POM_CONTENT" | grep -q "<artifactId>helper-test</artifactId>"; then
   echo "FAIL: POM missing test project dependency <artifactId>helper-test</artifactId>" >&2
+  exit 1
+fi
+
+# Must contain dependency on managed-lib with runtime scope (TD-2544)
+if ! echo "$POM_CONTENT" | grep -q "<artifactId>managed-lib</artifactId>"; then
+  echo "FAIL: POM missing test project dependency <artifactId>managed-lib</artifactId>" >&2
   exit 1
 fi
 
@@ -1094,6 +1254,12 @@ if ! grep -q 'itinkjar' "$DOWNSTREAM_LOG"; then
   exit 1
 fi
 
+# TD-2544 Scenario C (regression): [TD-2544] log presence in consumer-mod
+if ! grep -q '\[TD-2544\] addonTestClasspath_itink:' "$DOWNSTREAM_LOG"; then
+  echo "FAIL: Expected [TD-2544] addonTestClasspath_itink: in downstream log" >&2
+  exit 1
+fi
+
 # Verify test report confirms actual execution (tests="1", failures="0", errors="0")
 REPORT_FILE="$DOWNSTREAM_DIR/consumer-mod/build/test-results/testAddon_itink/TEST-ru.thedevs.itink.ItinkTest.xml"
 if [ ! -f "$REPORT_FILE" ]; then
@@ -1275,5 +1441,164 @@ if ! echo "$STRICT_OUTPUT" | grep -q "Strict mode enabled"; then
 fi
 
 echo "Strict mode vs pre-rollout behavior in same directory: PASSED"
+
+# 6. TD-2544: Consistent test libraries resolution scenarios (A, B, D, E)
+echo "=== TD-2544: Test Scenarios A, B, D, E ==="
+
+# Scenario A: Host declares library in testImplementation -> addonTestClasspath selects host version 1.1.0
+echo "Testing TD-2544 Scenario A: host declares helper-test:1.1.0 in testImplementation..."
+SCENARIO_A_DIR="$TEST_DIR/scenario-a"
+mkdir -p "$SCENARIO_A_DIR"
+cat > "$SCENARIO_A_DIR/settings.gradle" <<'EOF'
+rootProject.name = 'scenario-a'
+EOF
+cat > "$SCENARIO_A_DIR/build.gradle" <<EOF
+plugins {
+    id 'java'
+}
+group = 'ru.thedevs'
+version = '1.0.0'
+repositories {
+    maven { url = uri("${REPO_DIR}") }
+    mavenCentral()
+}
+dependencies {
+    implementation 'ru.thedevs:upstream-starter:1.0.0'
+    testImplementation 'ru.thedevs:helper-test:1.1.0'
+}
+EOF
+
+SCENARIO_A_LOG="$TEST_DIR/scenario-a.log"
+(cd "$SCENARIO_A_DIR" && gradle -I "$INIT_SCRIPT" dependencyInsight --configuration addonTestClasspath_itink --dependency helper-test --no-daemon 2>&1) | tee "$SCENARIO_A_LOG"
+
+head_coord_a=$(grep -E 'ru\.thedevs:helper-test:[0-9]' "$SCENARIO_A_LOG" | head -1)
+if [[ "$head_coord_a" != *"1.1.0"* ]]; then
+  echo "FAIL: Scenario A: Expected helper-test:1.1.0 selected in addonTestClasspath_itink, got: $head_coord_a" >&2
+  exit 1
+fi
+if [[ "$head_coord_a" == *"1.0.0"* ]]; then
+  echo "FAIL: Scenario A: Selected 1.0.0 instead of 1.1.0" >&2
+  exit 1
+fi
+echo "Scenario A: PASSED"
+
+# Scenario B: Host does not declare library, but connects BOM as platform -> raised to 1.1.0
+echo "Testing TD-2544 Scenario B: host connects fixture-bom as platform..."
+SCENARIO_B_DIR="$TEST_DIR/scenario-b"
+mkdir -p "$SCENARIO_B_DIR"
+cat > "$SCENARIO_B_DIR/settings.gradle" <<'EOF'
+rootProject.name = 'scenario-b'
+EOF
+cat > "$SCENARIO_B_DIR/build.gradle" <<EOF
+plugins {
+    id 'java'
+}
+group = 'ru.thedevs'
+version = '1.0.0'
+repositories {
+    maven { url = uri("${REPO_DIR}") }
+    mavenCentral()
+}
+dependencies {
+    implementation 'ru.thedevs:upstream-starter:1.0.0'
+    implementation platform('ru.thedevs:fixture-bom:1.0.0')
+}
+EOF
+
+SCENARIO_B_LOG="$TEST_DIR/scenario-b.log"
+(cd "$SCENARIO_B_DIR" && gradle -I "$INIT_SCRIPT" dependencyInsight --configuration addonTestClasspath_itink --dependency helper-test --no-daemon 2>&1) | tee "$SCENARIO_B_LOG"
+
+head_coord_b=$(grep -E 'ru\.thedevs:helper-test:[0-9]' "$SCENARIO_B_LOG" | head -1)
+if [[ "$head_coord_b" != *"1.1.0"* ]]; then
+  echo "FAIL: Scenario B: Expected helper-test:1.1.0 selected in addonTestClasspath_itink, got: $head_coord_b" >&2
+  exit 1
+fi
+echo "Scenario B: PASSED"
+
+# Scenario D: Conflict of layers with regular platform -> resolved to 1.2.0, category regular in log
+echo "Testing TD-2544 Scenario D: layer conflict resolution with regular platform..."
+SCENARIO_D_DIR="$TEST_DIR/scenario-d"
+mkdir -p "$SCENARIO_D_DIR"
+cat > "$SCENARIO_D_DIR/settings.gradle" <<'EOF'
+rootProject.name = 'scenario-d'
+EOF
+cat > "$SCENARIO_D_DIR/build.gradle" <<EOF
+plugins {
+    id 'java'
+}
+group = 'ru.thedevs'
+version = '1.0.0'
+repositories {
+    maven { url = uri("${REPO_DIR}") }
+    mavenCentral()
+}
+dependencies {
+    implementation 'ru.thedevs:upstream-starter:1.0.0'
+    implementation platform('ru.thedevs:fixture-bom:1.0.0')
+    implementation 'ru.thedevs:needs-managed:1.0.0'
+}
+EOF
+
+SCENARIO_D_LOG="$TEST_DIR/scenario-d.log"
+(cd "$SCENARIO_D_DIR" && gradle -I "$INIT_SCRIPT" dependencyInsight --configuration addonTestClasspath_itink --dependency managed-lib --no-daemon 2>&1) | tee "$SCENARIO_D_LOG"
+
+head_coord_d=$(grep -E 'ru\.thedevs:managed-lib:[0-9]' "$SCENARIO_D_LOG" | head -1)
+if [[ "$head_coord_d" != *"1.2.0"* ]]; then
+  echo "FAIL: Scenario D: Expected managed-lib:1.2.0 selected in addonTestClasspath_itink, got: $head_coord_d" >&2
+  exit 1
+fi
+
+SCENARIO_D_HOST_LOG="$TEST_DIR/scenario-d-host.log"
+(cd "$SCENARIO_D_DIR" && gradle -I "$INIT_SCRIPT" dependencyInsight --configuration testRuntimeClasspath --dependency managed-lib --no-daemon 2>&1) | tee "$SCENARIO_D_HOST_LOG"
+
+head_coord_d_host=$(grep -E 'ru\.thedevs:managed-lib:[0-9]' "$SCENARIO_D_HOST_LOG" | head -1)
+if [[ "$head_coord_d_host" != *"1.2.0"* ]]; then
+  echo "FAIL: Scenario D: Expected managed-lib:1.2.0 selected in testRuntimeClasspath, got: $head_coord_d_host" >&2
+  exit 1
+fi
+
+if ! grep -q '\[TD-2544\].*regular' "$SCENARIO_D_LOG"; then
+  echo "FAIL: Scenario D: Expected '[TD-2544] ... regular' in $SCENARIO_D_LOG" >&2
+  exit 1
+fi
+echo "Scenario D: PASSED"
+
+# Scenario E: Host connects fixture-bom as enforcedPlatform -> selected 1.1.0, category enforced in log
+echo "Testing TD-2544 Scenario E: host connects fixture-bom as enforcedPlatform..."
+SCENARIO_E_DIR="$TEST_DIR/scenario-e"
+mkdir -p "$SCENARIO_E_DIR"
+cat > "$SCENARIO_E_DIR/settings.gradle" <<'EOF'
+rootProject.name = 'scenario-e'
+EOF
+cat > "$SCENARIO_E_DIR/build.gradle" <<EOF
+plugins {
+    id 'java'
+}
+group = 'ru.thedevs'
+version = '1.0.0'
+repositories {
+    maven { url = uri("${REPO_DIR}") }
+    mavenCentral()
+}
+dependencies {
+    implementation 'ru.thedevs:upstream-starter:1.0.0'
+    implementation enforcedPlatform('ru.thedevs:fixture-bom:1.0.0')
+}
+EOF
+
+SCENARIO_E_LOG="$TEST_DIR/scenario-e.log"
+(cd "$SCENARIO_E_DIR" && gradle -I "$INIT_SCRIPT" dependencyInsight --configuration addonTestClasspath_itink --dependency helper-test --no-daemon 2>&1) | tee "$SCENARIO_E_LOG"
+
+head_coord_e=$(grep -E 'ru\.thedevs:helper-test:[0-9]' "$SCENARIO_E_LOG" | head -1)
+if [[ "$head_coord_e" != *"1.1.0"* ]]; then
+  echo "FAIL: Scenario E: Expected helper-test:1.1.0 selected in addonTestClasspath_itink, got: $head_coord_e" >&2
+  exit 1
+fi
+
+if ! grep -q '\[TD-2544\].*enforced' "$SCENARIO_E_LOG"; then
+  echo "FAIL: Scenario E: Expected '[TD-2544] ... enforced' in $SCENARIO_E_LOG" >&2
+  exit 1
+fi
+echo "Scenario E: PASSED"
 
 echo "=== All Contract Tests for setup-addon-tests PASSED ==="
