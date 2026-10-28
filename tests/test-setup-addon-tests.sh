@@ -137,9 +137,9 @@ public class ItinkTest {
             assertNotNull(getClass().getClassLoader().getResource(res), "Changelog resource must be resolvable via ClassLoader: " + res);
         }
 
-        boolean isConsumerHost = getClass().getClassLoader().getResource("ru/thedevs/consumer/persistence.xml") != null;
+        boolean expectHostEntities = !"false".equalsIgnoreCase(System.getProperty("itink.expectHostEntities"));
 
-        if (isConsumerHost) {
+        if (expectHostEntities) {
             assertNotNull(getClass().getClassLoader().getResource("ru/thedevs/consumer/liquibase/changelog.xml"),
                     "Host changelog must be resolvable via ClassLoader from host-resources");
             assertNotNull(getClass().getClassLoader().getResource("ru/thedevs/consumer/starter/starter-resource.txt"),
@@ -197,7 +197,7 @@ public class ItinkTest {
             ormText = reader.lines().collect(Collectors.joining("\n"));
         }
 
-        if (isConsumerHost) {
+        if (expectHostEntities) {
             // (3.3.a) First persistence.xml contains both ItinkEntity, ConsumerEntity, itink orm.xml, consumer orm.xml,
             // exactly one occurrence of each class, and exclude-unlisted-classes
             assertTrue(puText.contains("ru.thedevs.itink.ItinkEntity"), "Merged persistence.xml must contain ItinkEntity");
@@ -218,9 +218,25 @@ public class ItinkTest {
                        puText.contains("value=\"ru.thedevs.consumer.ConsumerConverter;ru.thedevs.itink.ItinkConverter\""),
                        "Converters list must be separated by ; and contain both converters without duplicates");
 
-            // (3.3.c) Host descriptor ru/thedevs/consumer/persistence.xml remains accessible and intact
+            // (3.3.c) Host descriptor ru/thedevs/consumer/persistence.xml remains accessible and NOT modified
             URL hostPuUrl = getClass().getClassLoader().getResource("ru/thedevs/consumer/persistence.xml");
             assertNotNull(hostPuUrl, "Host descriptor ru/thedevs/consumer/persistence.xml must remain accessible via ClassLoader");
+            String hostPuText;
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(hostPuUrl.openStream(), StandardCharsets.UTF_8))) {
+                hostPuText = reader.lines().collect(Collectors.joining("\n"));
+            }
+            assertTrue(hostPuText.contains("ru.thedevs.consumer.ConsumerEntity"),
+                    "Host descriptor must contain ConsumerEntity");
+            assertTrue(hostPuText.contains("ru/thedevs/consumer/orm.xml"),
+                    "Host descriptor must contain ru/thedevs/consumer/orm.xml");
+            assertTrue(hostPuText.contains("ru.thedevs.consumer.ConsumerConverter"),
+                    "Host descriptor must contain ConsumerConverter");
+            assertFalse(hostPuText.contains("ru.thedevs.itink.ItinkEntity"),
+                    "Host descriptor must not be modified by overlay (no ItinkEntity)");
+            assertFalse(hostPuText.contains("ru/thedevs/itink/orm.xml"),
+                    "Host descriptor must not be modified by overlay (no ru/thedevs/itink/orm.xml)");
+            assertFalse(hostPuText.contains("ru.thedevs.itink.ItinkConverter"),
+                    "Host descriptor must not be modified by overlay (no ItinkConverter)");
 
             // (3.5) Conflict fixture: ru/thedevs/itink/orm.xml does NOT contain ItinkEntity, but DOES contain ItinkOnlyEntity
             assertFalse(ormText.contains("ru.thedevs.itink.ItinkEntity"), "Shadowed orm.xml must not contain ItinkEntity superseded by host");
@@ -632,8 +648,8 @@ dependencies {
 EOF
 
 echo "Running downstream build and testAddonDependencies with ci-addon-tests.init.gradle..."
-DOWNSTREAM_BUILD_OUTPUT=$(cd "$DOWNSTREAM_DIR" && gradle -I "$INIT_SCRIPT" :consumer-mod:testAddonDependencies --no-daemon 2>&1)
-echo "$DOWNSTREAM_BUILD_OUTPUT"
+DOWNSTREAM_LOG="$TEST_DIR/downstream.log"
+(cd "$DOWNSTREAM_DIR" && gradle -I "$INIT_SCRIPT" :consumer-mod:testAddonDependencies --no-daemon 2>&1) | tee "$DOWNSTREAM_LOG"
 
 # 4. Validate Downstream Execution Results
 echo "Validating downstream testAddon execution results..."
@@ -644,13 +660,12 @@ if [ ! -f "$AGGREGATE_CHANGELOG" ]; then
   exit 1
 fi
 
-CHANGELOG_CONTENT=$(cat "$AGGREGATE_CHANGELOG")
-if ! echo "$CHANGELOG_CONTENT" | grep -q "ru/thedevs/itink/liquibase/changelog.xml"; then
+if ! grep -q "ru/thedevs/itink/liquibase/changelog.xml" "$AGGREGATE_CHANGELOG"; then
   echo "FAIL: Aggregate changelog missing dependency changelog" >&2
   exit 1
 fi
 
-if ! echo "$CHANGELOG_CONTENT" | grep -q "ru/thedevs/consumer/liquibase/changelog.xml"; then
+if ! grep -q "ru/thedevs/consumer/liquibase/changelog.xml" "$AGGREGATE_CHANGELOG"; then
   echo "FAIL: Aggregate changelog missing host changelog" >&2
   exit 1
 fi
@@ -699,13 +714,14 @@ if [ ! -f "$OVERLAY_ORM" ]; then
 fi
 
 # Verify original published itink-1.0.0.jar is intact
-ORIG_PU=$(unzip -p "$REPO_DIR/ru/thedevs/itink/1.0.0/itink-1.0.0.jar" ru/thedevs/itink/persistence.xml)
-if echo "$ORIG_PU" | grep -q "ConsumerEntity"; then
+ORIG_PU_FILE="$TEST_DIR/orig-pu.xml"
+unzip -p "$REPO_DIR/ru/thedevs/itink/1.0.0/itink-1.0.0.jar" ru/thedevs/itink/persistence.xml > "$ORIG_PU_FILE"
+if grep -q "ConsumerEntity" "$ORIG_PU_FILE"; then
   echo "FAIL: Original published itink-1.0.0.jar was modified to include ConsumerEntity!" >&2
   exit 1
 fi
 
-if ! echo "$DOWNSTREAM_BUILD_OUTPUT" | grep -q -- "(-1 entity entries superseded by host)"; then
+if ! grep -q -- "(-1 entity entries superseded by host)" "$DOWNSTREAM_LOG"; then
   echo "FAIL: Gradle log missing '(-1 entity entries superseded by host)'" >&2
   exit 1
 fi
@@ -773,6 +789,9 @@ dependencies {
     testRuntimeOnly 'org.junit.jupiter:junit-jupiter-engine:5.10.2'
     testRuntimeOnly 'org.junit.platform:junit-platform-launcher:1.10.2'
 }
+tasks.withType(Test).configureEach {
+    systemProperty 'itink.expectHostEntities', 'false'
+}
 // Emulate Jmix plugin generating empty descriptors without classes
 def generatedDescriptorsDir = layout.buildDirectory.dir('tmp/entitiesEnhancing/main').get().asFile
 def generateDescriptors = tasks.register('generateDescriptors') {
@@ -796,10 +815,8 @@ def generateDescriptors = tasks.register('generateDescriptors') {
 sourceSets.main.output.dir(generatedDescriptorsDir, builtBy: generateDescriptors)
 EOF
 
-(
-    cd "$NOENTITY_DIR"
-    gradle -I "$INIT_SCRIPT" :noentity-mod:testAddonDependencies --no-daemon
-)
+NOENTITY_LOG="$TEST_DIR/noentity.log"
+(cd "$NOENTITY_DIR" && gradle -I "$INIT_SCRIPT" :noentity-mod:testAddonDependencies --no-daemon 2>&1) | tee "$NOENTITY_LOG"
 
 NOENTITY_OVERLAY_DIR="$NOENTITY_DIR/noentity-mod/build/addon-tests/itink/persistence-overlay"
 if [ -d "$NOENTITY_OVERLAY_DIR" ]; then
