@@ -178,6 +178,164 @@ def resolveHostMainLiquibaseChangelog(Project p) {
     return null
 }
 
+// 1.6. TD-2533: Module Liquibase changelogs resolution
+def normalizeLiquibasePath(String raw) {
+    if (raw == null) return null
+    def s = raw.trim().replace('\\', '/')
+    if (s.startsWith('classpath:')) {
+        s = s.substring('classpath:'.length())
+    }
+    while (s.startsWith('/')) {
+        s = s.substring(1)
+    }
+    return s
+}
+
+def resolveModuleLiquibaseChangelogs(Project p) {
+    def runtimeClasspath = p.configurations.findByName('runtimeClasspath')
+    if (runtimeClasspath == null) return []
+
+    // 1. Files of components from resolved artifacts: group:name -> List<File>
+    Map<String, List<File>> filesByComponent = new LinkedHashMap<>()
+    try {
+        def artifacts = runtimeClasspath.resolvedConfiguration.resolvedArtifacts
+        for (def art : artifacts) {
+            if (art.file == null) continue
+            def mvid = art.moduleVersion?.id
+            if (mvid != null) {
+                String key = "${mvid.group}:${mvid.name}".toString()
+                filesByComponent.computeIfAbsent(key, { new ArrayList<File>() }).add(art.file)
+            }
+            if (art.id?.componentIdentifier instanceof ProjectComponentIdentifier) {
+                def pid = art.id.componentIdentifier as ProjectComponentIdentifier
+                def subproject = p.rootProject.findProject(pid.projectPath)
+                if (subproject != null) {
+                    String prjGroup = subproject.group?.toString() ?: p.group?.toString() ?: ''
+                    String prjKey = "${prjGroup}:${subproject.name}".toString()
+                    filesByComponent.computeIfAbsent(prjKey, { new ArrayList<File>() }).add(art.file)
+                }
+            }
+        }
+    } catch (Exception e) {
+        println "::warning::[TD-2533] Could not resolve artifacts for runtimeClasspath: ${e.message}"
+    }
+
+    // 2. Helper to get component info and key
+    def getComponentInfo = { ResolvedComponentResult comp ->
+        String group = comp.moduleVersion?.group ?: ''
+        String name = comp.moduleVersion?.name ?: ''
+        boolean isProject = (comp.id instanceof ProjectComponentIdentifier)
+        if (isProject && (group.isEmpty() || name.isEmpty())) {
+            def pid = comp.id as ProjectComponentIdentifier
+            def prj = p.rootProject.findProject(pid.projectPath)
+            if (group.isEmpty()) group = prj?.group?.toString() ?: p.group?.toString() ?: ''
+            if (name.isEmpty()) name = prj?.name ?: pid.projectName
+        }
+        String key = "${group}:${name}".toString()
+        boolean matchesFilter = isProject || group.startsWith('ru.thedevs') || group.startsWith('io.jmix')
+        return [group: group, name: name, key: key, isProject: isProject, matchesFilter: matchesFilter]
+    }
+
+    // 3. Depth-first search in post-order (dependencies before dependents)
+    def root = runtimeClasspath.incoming.resolutionResult.root
+    def rootInfo = getComponentInfo(root)
+    Set<String> visited = new HashSet<>()
+    if (rootInfo.key) {
+        visited.add(rootInfo.key)
+    }
+
+    List<Map> orderedCandidates = new ArrayList<>()
+
+    def visit
+    visit = { ResolvedComponentResult comp ->
+        def validDeps = comp.dependencies.findAll { dep ->
+            (dep instanceof ResolvedDependencyResult) && !(dep as ResolvedDependencyResult).constraint
+        }.collect { it as ResolvedDependencyResult }
+
+        validDeps.sort { a, b ->
+            def infoA = getComponentInfo(a.selected)
+            def infoB = getComponentInfo(b.selected)
+            return (infoA.key ?: '') <=> (infoB.key ?: '')
+        }
+
+        for (ResolvedDependencyResult dep : validDeps) {
+            def child = dep.selected
+            def childInfo = getComponentInfo(child)
+            if (childInfo.key && !visited.contains(childInfo.key)) {
+                visited.add(childInfo.key)
+                visit(child)
+                if (childInfo.matchesFilter) {
+                    orderedCandidates.add(childInfo)
+                }
+            }
+        }
+    }
+
+    visit(root)
+
+    // 4. Search for changelogs in each component's files
+    def changelogPattern = ~/^(?!META-INF\/).+\/liquibase\/changelog\.xml$/
+    Set<String> seenNormalizedPaths = new LinkedHashSet<>()
+    List<Map> result = new ArrayList<>()
+
+    for (def cand : orderedCandidates) {
+        def files = filesByComponent[cand.key] ?: []
+        List<Map> candChangelogs = new ArrayList<>()
+
+        for (File rootFile : files) {
+            if (rootFile == null || !rootFile.exists()) {
+                throw new GradleException("[TD-2533] Unreadable artifact '${rootFile?.absolutePath}': file does not exist")
+            }
+
+            if (rootFile.isDirectory()) {
+                try {
+                    rootFile.eachFileRecurse(groovy.io.FileType.FILES) { f ->
+                        String rel = rootFile.toPath().relativize(f.toPath()).toString().replace('\\', '/')
+                        if (rel.startsWith('/')) rel = rel.substring(1)
+                        if (rel =~ changelogPattern) {
+                            candChangelogs.add([path: rel, component: cand.key, root: rootFile])
+                        }
+                    }
+                } catch (Exception e) {
+                    throw new GradleException("[TD-2533] Unreadable artifact directory '${rootFile.absolutePath}': ${e.message}", e)
+                }
+            } else if (rootFile.isFile()) {
+                java.util.zip.ZipFile zf = null
+                try {
+                    zf = new java.util.zip.ZipFile(rootFile)
+                    def entries = zf.entries()
+                    while (entries.hasMoreElements()) {
+                        def entry = entries.nextElement()
+                        if (!entry.isDirectory()) {
+                            String entryName = entry.name.replace('\\', '/')
+                            if (entryName.startsWith('/')) entryName = entryName.substring(1)
+                            if (entryName =~ changelogPattern) {
+                                candChangelogs.add([path: entryName, component: cand.key, root: rootFile])
+                            }
+                        }
+                    }
+                } catch (Exception e) {
+                    throw new GradleException("[TD-2533] Unreadable artifact archive '${rootFile.absolutePath}': ${e.message}", e)
+                } finally {
+                    if (zf != null) {
+                        try { zf.close() } catch (Exception ignored) {}
+                    }
+                }
+            }
+        }
+
+        // Within component: sort lexicographically
+        candChangelogs.sort { a, b -> a.path <=> b.path }
+        for (def item : candChangelogs) {
+            if (seenNormalizedPaths.add(item.path)) {
+                result.add(item)
+            }
+        }
+    }
+
+    return result
+}
+
 // 1.5. TD-2526: Host and dependency store names resolution
 def parseStoreNames(Object rawValue) {
     if (rawValue == null) return []
@@ -587,6 +745,7 @@ gradle.projectsEvaluated {
             unpackTask.inputs.files(addonTestClasspath.incoming.artifactView {
                 lenient(true)
             }.files)
+            unpackTask.inputs.files(runtimeClasspath)
             unpackTask.inputs.files({
                 def hc = resolveHostMainLiquibaseChangelog(p)
                 (hc != null && hc.file != null) ? p.files(hc.file) : p.files()
@@ -738,22 +897,58 @@ gradle.projectsEvaluated {
                     }
                 }
 
+                def moduleChangelogs = resolveModuleLiquibaseChangelogs(p)
+
+                def normDepChangelog = normalizeLiquibasePath(depChangelog)
+                def normHostChangelog = normalizeLiquibasePath(hostChangelog)
+
+                boolean depMatchesModule = (normDepChangelog != null && moduleChangelogs.any { it.path == normDepChangelog })
+
                 def xmlBuilder = new StringBuilder()
                 xmlBuilder.append('<?xml version="1.0" encoding="UTF-8"?>\n')
                 xmlBuilder.append('<databaseChangeLog\n')
                 xmlBuilder.append('    xmlns="http://www.liquibase.org/xml/ns/dbchangelog"\n')
                 xmlBuilder.append('    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"\n')
                 xmlBuilder.append('    xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog\n')
-                xmlBuilder.append('        http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-latest.xsd">\n')
+                xmlBuilder.append('        http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-latest.xsd">\n\n')
 
-                if (depChangelog != null && !hostAlreadyIncludesDep) {
-                    xmlBuilder.append("    <include file=\"${depChangelog}\" relativeToChangelogFile=\"false\"/>\n")
+                xmlBuilder.append('    <property name="uuid.type" dbms="oracle" value="varchar2(32)"/>\n')
+                xmlBuilder.append('    <property name="uuid.type" dbms="!oracle" value="uuid"/>\n')
+
+                def recordedModulePaths = []
+                String depPosition = depMatchesModule ? "topological" : "first"
+
+                if (!depMatchesModule) {
+                    if (depChangelog != null && !hostAlreadyIncludesDep) {
+                        xmlBuilder.append("    <include file=\"${depChangelog}\" relativeToChangelogFile=\"false\"/>\n")
+                    }
+                    for (def mc : moduleChangelogs) {
+                        if (mc.path == normHostChangelog) continue
+                        xmlBuilder.append("    <include file=\"/${mc.path}\" relativeToChangelogFile=\"false\"/>\n")
+                        recordedModulePaths.add("/${mc.path}".toString())
+                    }
+                } else {
+                    for (def mc : moduleChangelogs) {
+                        if (mc.path == normHostChangelog) continue
+                        if (mc.path == normDepChangelog) {
+                            if (!hostAlreadyIncludesDep) {
+                                xmlBuilder.append("    <include file=\"/${mc.path}\" relativeToChangelogFile=\"false\"/>\n")
+                                recordedModulePaths.add("/${mc.path}".toString())
+                            }
+                        } else {
+                            xmlBuilder.append("    <include file=\"/${mc.path}\" relativeToChangelogFile=\"false\"/>\n")
+                            recordedModulePaths.add("/${mc.path}".toString())
+                        }
+                    }
                 }
+
                 if (hostChangelog != null) {
                     xmlBuilder.append("    <include file=\"${hostChangelog}\" relativeToChangelogFile=\"false\"/>\n")
                 }
                 xmlBuilder.append('</databaseChangeLog>\n')
                 aggregateFile.text = xmlBuilder.toString()
+
+                println "[TD-2533] aggregate-changelog for '${baseModule}': dep changelog position=${depPosition}, module changelogs=${recordedModulePaths.join(', ')}"
             }
 
             // 3. Configure test task
@@ -1198,6 +1393,8 @@ gradle.projectsEvaluated {
                 testAddon.systemProperty('main.liquibase.change-log', 'classpath:aggregate-changelog.xml')
                 testAddon.systemProperty('spring.liquibase.change-log', 'classpath:aggregate-changelog.xml')
                 testAddon.systemProperty('liquibase.duplicateFileMode', 'WARN')
+                testAddon.systemProperty('liquibase.allowDuplicatedChangesetIdentifiers', 'true')
+                println "[TD-2533] testAddon_${baseModule}: liquibase.allowDuplicatedChangesetIdentifiers=true"
             }
 
             testAddonDependencies.dependsOn(testAddon)
