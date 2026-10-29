@@ -981,6 +981,7 @@ gradle.projectsEvaluated {
 
                 def recordedModulePaths = []
                 String depPosition = depMatchesModule ? "topological" : "first"
+                boolean depIncluded = depChangelog != null && (depMatchesModule || !hostAlreadyIncludesDep)
 
                 if (!depMatchesModule) {
                     if (depChangelog != null && !hostAlreadyIncludesDep) {
@@ -1000,7 +1001,7 @@ gradle.projectsEvaluated {
                 xmlBuilder.append('</databaseChangeLog>\n')
                 aggregateFile.text = xmlBuilder.toString()
 
-                println "[TD-2533] aggregate-changelog for '${baseModule}': dep changelog position=${depPosition}, module changelogs=${recordedModulePaths.join(', ')}"
+                println "[TD-2533] aggregate-changelog for '${baseModule}': dep changelog position=${depPosition}, dep changelog path=${normDepChangelog ?: 'none'}, dep changelog included=${depIncluded}, host changelog=${normHostChangelog ?: 'none'}, module changelogs=${recordedModulePaths.join(', ')}"
             }
 
             // 3. Configure test task

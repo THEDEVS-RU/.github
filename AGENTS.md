@@ -128,15 +128,20 @@ Changelog модулей Jmix обнаруживаются по пути `<baseP
 - **Почему не используется анализ контекстов и замыкания include в харнессе:** мастера модулей вкладывают друг друга под контекстом `@jmix-addon` (core вкладывает Jmix, cryptocore вкладывает balance). Анализ и разбор выражений `contextFilter` на этапе генерации скрипта Gradle сложен, хрупок и зависит от рантайм-контекстов конкретного теста. Штатный флаг Liquibase гарантирует корректный пропуск вложенных дублей при любом наборе активных контекстов без разбора содержимого файлов.
 
 #### Контракт модуля
-Changelog миграций модуля Jmix обязан располагаться по стандартному пути `<basePackage>/liquibase/changelog.xml` (например, `ru/thedevs/crypto/liquibase/changelog.xml`).
+- Changelog миграций модуля Jmix обязан располагаться по стандартному пути `<basePackage>/liquibase/changelog.xml` (например, `ru/thedevs/crypto/liquibase/changelog.xml`).
+- **Тестовый changelog зависимости:** если `main.liquibase.change-log` зависимости не совпадает с changelog какого-либо модуля транзитивного замыкания, он применяется **первым** (`position=first`) в агрегате. Отсюда следуют два платформенных правила.
+  - Первое правило: тестовый changelog зависимости не должен дублировать DDL других модулей самописными changeSet'ами (shim'ами), а обязан включать настоящие файлы upstream-модулей через `<include file="..."/>`. В этом случае Liquibase видит один и тот же файл (`logicalFilePath`) и id, и повторное вхождение пропускает дубль-фильтр. Допустимы собственные changeSet'ы с тестовыми данными, не пересекающиеся со схемой модулей.
+  - Второе правило: поскольку тестовый changelog применяется первым, он не может опираться на `<property>`, объявленные в changelog'ах модулей, идущих позже (например, `offsetDateTime.type` объявлен только в `io/jmix/email/liquibase/changelog.xml`, `dep-sources/io.jmix.email/jmix-email-3.0.0@local:…:35`). Свойства, нужные включённым upstream-файлам, он объявляет сам до первого `include` (как `THEDEVS-RU/addon-core-ai@dev:coreai/src/test/resources/ru/thedevs/coreai/liquibase/test-changelog.xml:28`).
+  - Примеры нарушения первого правила: шим `add-business-role-id-to-core-user` в `addon-chats` (TD-2565, спека `2026-10-29-chats-td2565-test-changelog-real-business-role`) и заглушки `0-create-core-secret-table` в `addon-yandex-metrika` и `addon-yandex-webmaster` (спеки `2026-10-29-metrika-td2565-test-changelog-real-core-secret` и `2026-10-29-webmaster-td2565-test-changelog-real-core-secret`, ветки `arch/<id>` соответствующих репозиториев; это отдельные follow-up, в приёмку TD-2565 не входят).
 
 #### Диагностика
-- `[TD-2533] aggregate-changelog for '<dep>': dep changelog position=<first|topological>, module changelogs=<paths>` — лог генерации агрегата;
+- `[TD-2533] aggregate-changelog for '<dep>': dep changelog position=<first|topological>, dep changelog path=<path|none>, dep changelog included=<true|false>, host changelog=<path|none>, module changelogs=<paths>` — лог генерации агрегата;
 - `[TD-2533] testAddon_<dep>: liquibase.allowDuplicatedChangesetIdentifiers=true` — подтверждение выставления флага в JVM.
 
 #### Компромиссы и риски
 - Флаг `liquibase.allowDuplicatedChangesetIdentifiers=true` пропускает случайные дубли changeSet с одинаковым id/автором внутри одного файла/пути в контексте `testAddon_*`. Такие дубли по-прежнему ловятся собственными тестами модулей и production-запуском хоста.
 - Добавление changelog транзитивных модулей в схему `testAddon` может выявить ранее скрытые ошибки миграций на реальной СУБД (PostgreSQL), что является ожидаемой платой за соответствие боевой схеме.
+- Дубль-фильтр отождествляет только changeSet'ы с совпадающими путём, id и author; конфликтующий DDL с иной идентичностью не отсекается и проявляется как ошибка миграции в `testAddon_*`.
 
 ### Версии тестовых библиотек в addonTestClasspath (TD-2544)
 

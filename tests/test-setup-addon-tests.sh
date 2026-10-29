@@ -1135,6 +1135,14 @@ if ! grep -q "\[TD-2533\] aggregate-changelog for 'itink'" "$DOWNSTREAM_LOG"; th
   echo "FAIL: Expected '[TD-2533] aggregate-changelog for '\''itink'\''' in $DOWNSTREAM_LOG" >&2
   exit 1
 fi
+if ! grep -q "dep changelog path=ru/thedevs/itink/liquibase/changelog.xml" "$DOWNSTREAM_LOG"; then
+  echo "FAIL: Expected 'dep changelog path=ru/thedevs/itink/liquibase/changelog.xml' in $DOWNSTREAM_LOG" >&2
+  exit 1
+fi
+if ! grep -q "dep changelog included=true" "$DOWNSTREAM_LOG"; then
+  echo "FAIL: Expected 'dep changelog included=true' in $DOWNSTREAM_LOG" >&2
+  exit 1
+fi
 if ! grep -q "\[TD-2533\] testAddon_itink: liquibase.allowDuplicatedChangesetIdentifiers=true" "$DOWNSTREAM_LOG"; then
   echo "FAIL: Expected '[TD-2533] testAddon_itink: liquibase.allowDuplicatedChangesetIdentifiers=true' in $DOWNSTREAM_LOG" >&2
   exit 1
