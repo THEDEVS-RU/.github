@@ -625,6 +625,8 @@ publishing {
     }
 }
 EOF
+
+mkdir -p "$UPSTREAM_DIR/nomodprops/src/main/resources/ru/thedevs/nomodprops/liquibase"
 cat > "$UPSTREAM_DIR/nomodprops/src/main/resources/ru/thedevs/nomodprops/liquibase/changelog.xml" <<'EOF'
 <?xml version="1.0" encoding="UTF-8"?>
 <databaseChangeLog
