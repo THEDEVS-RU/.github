@@ -98,9 +98,8 @@ def readSuperClassNameFromClassBytes(byte[] bytes) {
     try {
         DataInputStream dis = new DataInputStream(new ByteArrayInputStream(bytes))
         int magic = dis.readInt()
-        if (magic != 0xCAFEBABE) return null
-        int minor = dis.readUnsignedShort()
-        int major = dis.readUnsignedShort()
+        if ((magic & 0xFFFFFFFFL) != 0xCAFEBABEL) return null
+        dis.skipBytes(4)
         int cpCount = dis.readUnsignedShort()
         Object[] cp = new Object[cpCount]
         int i = 1
@@ -157,6 +156,7 @@ def readSuperClassNameFromClassBytes(byte[] bytes) {
             }
         }
     } catch (Exception e) {
+        println "::warning::[TD-2521] Failed to parse bytecode for superclass: ${e.message}"
         return null
     }
     return null
@@ -172,30 +172,6 @@ def formatClasspathRoot(File f, Project p) {
     } catch (Exception e) {
         return f.name
     }
-}
-
-def findClassBytesInRoot(File root, String className) {
-    if (root == null || !root.exists() || className == null || className.isEmpty()) return null
-    String relPath = className.replace('.', '/') + '.class'
-    if (root.isDirectory()) {
-        File cf = new File(root, relPath)
-        if (cf.exists() && cf.isFile()) {
-            return cf.bytes
-        }
-    } else if (root.isFile() && (root.name.endsWith('.jar') || root.name.endsWith('.zip'))) {
-        try {
-            def zf = new ZipFile(root)
-            try {
-                def entry = zf.getEntry(relPath)
-                if (entry != null && !entry.isDirectory()) {
-                    return zf.getInputStream(entry).bytes
-                }
-            } finally {
-                zf.close()
-            }
-        } catch (Exception e) {}
-    }
-    return null
 }
 
 def resolveProjectTestLiquibaseChangelog(Project p) {
@@ -1504,38 +1480,39 @@ gradle.projectsEvaluated {
                     if (aggregateFile.parentFile.exists()) {
                         orderedRoots.add(aggregateFile.parentFile)
                     }
-                    hostResourcesDirs.each { rd ->
-                        if (rd != null) {
-                            def rf = (rd instanceof File) ? rd : (rd.hasProperty('asFile') ? rd.asFile : new File(rd.toString()))
-                            if (rf.exists()) orderedRoots.add(rf)
-                        }
+                    p.files(hostResourcesDirs).files.each { rf ->
+                        if (rf != null && rf.exists()) orderedRoots.add(rf)
                     }
                     try {
                         addonTestClasspath.files.each { rf ->
-                            if (rf.exists()) orderedRoots.add(rf)
+                            if (rf != null && rf.exists()) orderedRoots.add(rf)
                         }
-                    } catch (Exception ignoredRootsEx) {}
+                    } catch (Exception e) {
+                        println "::warning::[TD-2521] Could not resolve addonTestClasspath files: ${e.message}"
+                    }
                     p.sourceSets.main.output.classesDirs.files.each { rf ->
-                        if (rf.exists()) orderedRoots.add(rf)
+                        if (rf != null && rf.exists()) orderedRoots.add(rf)
                     }
                     p.sourceSets.main.output.dirs.files.each { rf ->
-                        if (rf.exists()) orderedRoots.add(rf)
+                        if (rf != null && rf.exists()) orderedRoots.add(rf)
                     }
                     if (starterClassesDirs != null) {
                         starterClassesDirs.files.each { rf ->
-                            if (rf.exists()) orderedRoots.add(rf)
+                            if (rf != null && rf.exists()) orderedRoots.add(rf)
                         }
                     }
                     if (starterGeneratedDirs != null) {
                         starterGeneratedDirs.files.each { rf ->
-                            if (rf.exists()) orderedRoots.add(rf)
+                            if (rf != null && rf.exists()) orderedRoots.add(rf)
                         }
                     }
                     try {
                         runtimeClasspath.files.each { rf ->
-                            if (rf.exists()) orderedRoots.add(rf)
+                            if (rf != null && rf.exists()) orderedRoots.add(rf)
                         }
-                    } catch (Exception ignoredRootsEx) {}
+                    } catch (Exception e) {
+                        println "::warning::[TD-2521] Could not resolve runtimeClasspath files: ${e.message}"
+                    }
                     orderedRoots = orderedRoots.unique()
 
                     def puClasses = new LinkedHashSet<String>(textValues(pu, "class"))
@@ -1543,100 +1520,143 @@ gradle.projectsEvaluated {
                     def relTags = ['many-to-one', 'one-to-one', 'one-to-many', 'many-to-many']
                     def seenChecks = new LinkedHashSet<String>()
 
-                    puMappingFiles.each { mappingFile ->
-                        Document diagMfDoc = null
-                        File shadowMf = new File(overlayDir, mappingFile)
-                        if (shadowMf.exists() && shadowMf.isFile()) {
-                            try {
-                                diagMfDoc = shadowMf.withInputStream { is -> createSafeDocumentBuilder().parse(is) }
-                            } catch (Exception ignoredParseEx) {}
+                    Map<File, ZipFile> openZipFiles = new LinkedHashMap<>()
+                    Map<String, Map> classResolutionCache = new LinkedHashMap<>()
+
+                    def resolveClassEntry = { String className ->
+                        if (className == null || className.isEmpty()) return null
+                        if (classResolutionCache.containsKey(className)) {
+                            return classResolutionCache[className]
                         }
-                        if (diagMfDoc == null) {
-                            File hostMf = hostOutputDirs.collect { new File(it, mappingFile) }.find { it.exists() && it.isFile() }
-                            if (hostMf != null) {
+
+                        String relPath = className.replace('.', '/') + '.class'
+                        File targetFoundRoot = null
+                        byte[] targetBytes = null
+
+                        for (File r : orderedRoots) {
+                            if (!r.exists()) continue
+                            if (r.isDirectory()) {
+                                File cf = new File(r, relPath)
+                                if (cf.exists() && cf.isFile()) {
+                                    targetFoundRoot = r
+                                    targetBytes = cf.bytes
+                                    break
+                                }
+                            } else if (r.isFile() && (r.name.endsWith('.jar') || r.name.endsWith('.zip'))) {
                                 try {
-                                    diagMfDoc = hostMf.withInputStream { is -> createSafeDocumentBuilder().parse(is) }
-                                } catch (Exception ignoredParseEx) {}
+                                    ZipFile zf = openZipFiles.computeIfAbsent(r, { f -> new ZipFile(f) })
+                                    def entry = zf.getEntry(relPath)
+                                    if (entry != null && !entry.isDirectory()) {
+                                        targetFoundRoot = r
+                                        targetBytes = zf.getInputStream(entry).bytes
+                                        break
+                                    }
+                                } catch (Exception e) {
+                                    println "::warning::[TD-2521] Failed to read ${className} from archive ${r.path}: ${e.message}"
+                                }
                             }
                         }
-                        if (diagMfDoc == null) {
-                            try {
-                                diagMfDoc = withResourceInputStream(mappingFile) { is -> createSafeDocumentBuilder().parse(is) }
-                            } catch (Exception ignoredParseEx) {}
-                        }
 
-                        if (diagMfDoc == null) return
+                        def res = [foundRoot: targetFoundRoot, bytes: targetBytes]
+                        classResolutionCache[className] = res
+                        return res
+                    }
 
-                        def rootEl = diagMfDoc.documentElement
-                        def entityNodes = rootEl.childNodes
-                        for (int ei = 0; ei < entityNodes.length; ei++) {
-                            def eNode = entityNodes.item(ei)
-                            if (eNode.nodeType == Node.ELEMENT_NODE) {
-                                def eEl = eNode as Element
-                                def eTag = localXmlTag(eEl)
-                                if (['entity', 'mapped-superclass', 'embeddable'].contains(eTag)) {
-                                    def entityClass = eEl.getAttribute('class')?.trim() ?: ''
+                    try {
+                        puMappingFiles.each { mappingFile ->
+                            Document diagMfDoc = null
+                            File shadowMf = new File(overlayDir, mappingFile)
+                            if (shadowMf.exists() && shadowMf.isFile()) {
+                                try {
+                                    diagMfDoc = shadowMf.withInputStream { is -> createSafeDocumentBuilder().parse(is) }
+                                } catch (Exception e) {
+                                    println "::warning::[TD-2521] Failed to parse overlay mapping-file '${mappingFile}': ${e.message}"
+                                }
+                            }
+                            if (diagMfDoc == null) {
+                                File hostMf = hostOutputDirs.collect { new File(it, mappingFile) }.find { it.exists() && it.isFile() }
+                                if (hostMf != null) {
+                                    try {
+                                        diagMfDoc = hostMf.withInputStream { is -> createSafeDocumentBuilder().parse(is) }
+                                    } catch (Exception e) {
+                                        println "::warning::[TD-2521] Failed to parse host mapping-file '${mappingFile}': ${e.message}"
+                                    }
+                                }
+                            }
+                            if (diagMfDoc == null) {
+                                try {
+                                    diagMfDoc = withResourceInputStream(mappingFile) { is -> createSafeDocumentBuilder().parse(is) }
+                                } catch (Exception e) {
+                                    println "::warning::[TD-2521] Failed to parse candidate mapping-file '${mappingFile}': ${e.message}"
+                                }
+                            }
 
-                                    def relElements = []
-                                    def collectRels
-                                    collectRels = { Node parentNode ->
-                                        def children = parentNode.childNodes
-                                        for (int ci = 0; ci < children.length; ci++) {
-                                            def ch = children.item(ci)
-                                            if (ch.nodeType == Node.ELEMENT_NODE) {
-                                                def chEl = ch as Element
-                                                def chTag = localXmlTag(chEl)
-                                                if (relTags.contains(chTag)) {
-                                                    relElements.add(chEl)
-                                                } else {
-                                                    collectRels(chEl)
+                            if (diagMfDoc == null) return
+
+                            def rootEl = diagMfDoc.documentElement
+                            def entityNodes = rootEl.childNodes
+                            for (int ei = 0; ei < entityNodes.length; ei++) {
+                                def eNode = entityNodes.item(ei)
+                                if (eNode.nodeType == Node.ELEMENT_NODE) {
+                                    def eEl = eNode as Element
+                                    def eTag = localXmlTag(eEl)
+                                    if (['entity', 'mapped-superclass', 'embeddable'].contains(eTag)) {
+                                        def entityClass = eEl.getAttribute('class')?.trim() ?: ''
+
+                                        def relElements = []
+                                        def collectRels
+                                        collectRels = { Node parentNode ->
+                                            def children = parentNode.childNodes
+                                            for (int ci = 0; ci < children.length; ci++) {
+                                                def ch = children.item(ci)
+                                                if (ch.nodeType == Node.ELEMENT_NODE) {
+                                                    def chEl = ch as Element
+                                                    def chTag = localXmlTag(chEl)
+                                                    if (relTags.contains(chTag)) {
+                                                        relElements.add(chEl)
+                                                    } else {
+                                                        collectRels(chEl)
+                                                    }
                                                 }
                                             }
                                         }
-                                    }
-                                    collectRels(eEl)
+                                        collectRels(eEl)
 
-                                    relElements.each { relEl ->
-                                        def attrName = relEl.getAttribute('name')?.trim() ?: ''
-                                        def target = relEl.getAttribute('target-entity')?.trim() ?: ''
-                                        if (target) {
-                                            def checkKey = "${entityClass}.${attrName}->${target}"
-                                            if (seenChecks.add(checkKey)) {
-                                                boolean isListed = puClasses.contains(target)
+                                        relElements.each { relEl ->
+                                            def attrName = relEl.getAttribute('name')?.trim() ?: ''
+                                            def target = relEl.getAttribute('target-entity')?.trim() ?: ''
+                                            if (target) {
+                                                def checkKey = "${entityClass}.${attrName}->${target}"
+                                                if (seenChecks.add(checkKey)) {
+                                                    boolean isListed = puClasses.contains(target)
+                                                    def targetRes = resolveClassEntry(target)
+                                                    File targetFoundRoot = targetRes?.foundRoot
+                                                    byte[] targetBytes = targetRes?.bytes
 
-                                                File targetFoundRoot = null
-                                                byte[] targetBytes = null
-                                                for (File r : orderedRoots) {
-                                                    byte[] b = findClassBytesInRoot(r, target)
-                                                    if (b != null) {
-                                                        targetFoundRoot = r
-                                                        targetBytes = b
-                                                        break
-                                                    }
-                                                }
-
-                                                if (targetFoundRoot != null) {
-                                                    String targetRoot = formatClasspathRoot(targetFoundRoot, p)
-                                                    String superClass = readSuperClassNameFromClassBytes(targetBytes)
-                                                    String superRoot = 'missing'
-                                                    if (superClass != null) {
-                                                        for (File r : orderedRoots) {
-                                                            byte[] b = findClassBytesInRoot(r, superClass)
-                                                            if (b != null) {
-                                                                superRoot = formatClasspathRoot(r, p)
-                                                                break
+                                                    if (targetFoundRoot != null) {
+                                                        String targetRoot = formatClasspathRoot(targetFoundRoot, p)
+                                                        String superClass = readSuperClassNameFromClassBytes(targetBytes)
+                                                        String superRoot = 'missing'
+                                                        if (superClass != null) {
+                                                            def superRes = resolveClassEntry(superClass)
+                                                            if (superRes?.foundRoot != null) {
+                                                                superRoot = formatClasspathRoot(superRes.foundRoot, p)
                                                             }
                                                         }
+                                                        println "[TD-2521] overlay check '${baseModule}': ${entityClass}.${attrName} -> ${target} listed=${isListed} root=${targetRoot} super=${superClass ?: 'none'} superRoot=${superRoot}"
+                                                    } else {
+                                                        println "[TD-2521] overlay check '${baseModule}': ${entityClass}.${attrName} -> ${target} listed=${isListed} root=missing"
                                                     }
-                                                    println "[TD-2521] overlay check '${baseModule}': ${entityClass}.${attrName} -> ${target} listed=${isListed} root=${targetRoot} super=${superClass ?: 'none'} superRoot=${superRoot}"
-                                                } else {
-                                                    println "[TD-2521] overlay check '${baseModule}': ${entityClass}.${attrName} -> ${target} listed=${isListed} root=missing"
                                                 }
                                             }
                                         }
                                     }
                                 }
                             }
+                        }
+                    } finally {
+                        openZipFiles.values().each { zf ->
+                            try { zf.close() } catch (Exception ignoredCloseEx) {}
                         }
                     }
                 }
