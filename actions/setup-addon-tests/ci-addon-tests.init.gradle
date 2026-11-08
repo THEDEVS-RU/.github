@@ -162,6 +162,78 @@ def readSuperClassNameFromClassBytes(byte[] bytes) {
     return null
 }
 
+def hasEntityAnnotationInClassBytes(byte[] bytes) {
+    if (bytes == null || bytes.length < 10) return false
+    try {
+        DataInputStream dis = new DataInputStream(new ByteArrayInputStream(bytes))
+        int magic = dis.readInt()
+        if ((magic & 0xFFFFFFFFL) != 0xCAFEBABEL) return false
+        dis.skipBytes(4)
+        int cpCount = dis.readUnsignedShort()
+        int i = 1
+        while (i < cpCount) {
+            int tag = dis.readUnsignedByte()
+            switch (tag) {
+                case 1: // CONSTANT_Utf8
+                    String utf8 = dis.readUTF()
+                    if (utf8 == 'Ljakarta/persistence/Entity;' ||
+                        utf8 == 'Ljakarta/persistence/MappedSuperclass;' ||
+                        utf8 == 'Ljakarta/persistence/Embeddable;') {
+                        return true
+                    }
+                    break
+                case 3: // CONSTANT_Integer
+                case 4: // CONSTANT_Float
+                    dis.skipBytes(4)
+                    break
+                case 5: // CONSTANT_Long
+                case 6: // CONSTANT_Double
+                    dis.skipBytes(8)
+                    i++
+                    break
+                case 7: // CONSTANT_Class
+                case 8: // CONSTANT_String
+                case 16: // CONSTANT_MethodType
+                case 19: // CONSTANT_Module
+                case 20: // CONSTANT_Package
+                    dis.skipBytes(2)
+                    break
+                case 9: // CONSTANT_Fieldref
+                case 10: // CONSTANT_Methodref
+                case 11: // CONSTANT_InterfaceMethodref
+                case 12: // CONSTANT_NameAndType
+                case 17: // CONSTANT_Dynamic
+                case 18: // CONSTANT_InvokeDynamic
+                    dis.skipBytes(4)
+                    break
+                case 15: // CONSTANT_MethodHandle
+                    dis.skipBytes(3)
+                    break
+                default:
+                    return false
+            }
+            i++
+        }
+    } catch (Exception e) {
+        return false
+    }
+    return false
+}
+
+def countDescriptorClasses(InputStream is) {
+    if (is == null) return 0
+    try {
+        Document doc = createSafeDocumentBuilder().parse(is)
+        def puNodes = doc.getElementsByTagName("persistence-unit")
+        if (puNodes.length > 0) {
+            return textValues(puNodes.item(0) as Element, "class").size()
+        }
+    } catch (Exception e) {
+        return 0
+    }
+    return 0
+}
+
 def formatClasspathRoot(File f, Project p) {
     if (f == null) return 'missing'
     if (f.isFile()) {
@@ -1254,8 +1326,16 @@ gradle.projectsEvaluated {
                         root.file.eachFileRecurse(groovy.io.FileType.FILES) { f ->
                             String rel = root.file.toPath().relativize(f.toPath()).toString().replace('\\', '/')
                             if (!rel.startsWith('META-INF/') && (f.name == 'persistence.xml' || f.name.endsWith('-persistence.xml'))) {
+                                int classCount = 0
+                                try {
+                                    classCount = f.withInputStream { is -> countDescriptorClasses(is) }
+                                } catch (Exception e) {
+                                    println "::warning::[TD-2521] Could not count classes in ${f}: ${e.message}"
+                                }
                                 if (!candidatesByRelPath.containsKey(rel)) {
-                                    candidatesByRelPath.put(rel, [relPath: rel, fileName: f.name, root: root])
+                                    candidatesByRelPath.put(rel, [relPath: rel, fileName: f.name, root: root, classesCount: classCount, shadowed: []])
+                                } else {
+                                    candidatesByRelPath[rel].shadowed.add([root: root, classesCount: classCount])
                                 }
                             }
                         }
@@ -1269,8 +1349,16 @@ gradle.projectsEvaluated {
                                     String rel = entry.name.replace('\\', '/')
                                     String entryFileName = rel.substring(rel.lastIndexOf('/') + 1)
                                     if (!rel.startsWith('META-INF/') && (entryFileName == 'persistence.xml' || entryFileName.endsWith('-persistence.xml'))) {
+                                        int classCount = 0
+                                        try {
+                                            classCount = zf.getInputStream(entry).withStream { is -> countDescriptorClasses(is) }
+                                        } catch (Exception e) {
+                                            println "::warning::[TD-2521] Could not count classes in ${rel} in ${root.file}: ${e.message}"
+                                        }
                                         if (!candidatesByRelPath.containsKey(rel)) {
-                                            candidatesByRelPath.put(rel, [relPath: rel, fileName: entryFileName, root: root])
+                                            candidatesByRelPath.put(rel, [relPath: rel, fileName: entryFileName, root: root, classesCount: classCount, shadowed: []])
+                                        } else {
+                                            candidatesByRelPath[rel].shadowed.add([root: root, classesCount: classCount])
                                         }
                                     }
                                 }
@@ -1278,6 +1366,13 @@ gradle.projectsEvaluated {
                         } finally {
                             zf.close()
                         }
+                    }
+                }
+
+                candidatesByRelPath.values().each { cand ->
+                    println "[TD-2521] overlay candidate '${baseModule}': ${cand.relPath} root=${formatClasspathRoot(cand.root.file as File, p)} classes=${cand.classesCount}"
+                    cand.shadowed?.each { sc ->
+                        println "[TD-2521] overlay candidate '${baseModule}': ${cand.relPath} shadowed copy root=${formatClasspathRoot(sc.root.file as File, p)} classes=${sc.classesCount}"
                     }
                 }
 
@@ -1470,6 +1565,12 @@ gradle.projectsEvaluated {
                     if (addedModuleEntities.size() > 0) {
                         println "[TD-2521] Persistence overlay for '${baseModule}': ${candidateRelPath} (+${addedModuleEntities.size()} module classes)"
                     }
+                    def mergedClasses = textValues(pu, "class")
+                    println "::group::[TD-2521] merged '${baseModule}': ${candidateRelPath} (${mergedClasses.size()} classes)"
+                    mergedClasses.each { cls ->
+                        println cls
+                    }
+                    println "::endgroup::"
 
                     // Shadowing copies of dependency mapping files
                     depMappingFiles.each { mappingFile ->
@@ -1618,6 +1719,25 @@ gradle.projectsEvaluated {
                             classResolutionCache[className] = res
                             return res
                         }
+
+                        int entityOkCount = 0
+                        puClasses.each { cls ->
+                            def classRes = resolveClassEntry(cls)
+                            File classRoot = classRes?.foundRoot
+                            byte[] classBytes = classRes?.bytes
+                            if (classRoot == null) {
+                                println "[TD-2521] overlay check '${baseModule}': listed class ${cls} root=missing entity=missing"
+                            } else {
+                                boolean hasEntityAnn = hasEntityAnnotationInClassBytes(classBytes)
+                                if (hasEntityAnn) {
+                                    entityOkCount++
+                                } else {
+                                    String rootStr = formatClasspathRoot(classRoot, p)
+                                    println "[TD-2521] overlay check '${baseModule}': listed class ${cls} root=${rootStr} entity=false"
+                                }
+                            }
+                        }
+                        println "[TD-2521] overlay check '${baseModule}': ${candidateRelPath} listed=${puClasses.size()} entity-ok=${entityOkCount}"
 
                         puMappingFiles.each { mappingFile ->
                             Document diagMfDoc = null
