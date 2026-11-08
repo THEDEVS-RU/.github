@@ -289,6 +289,7 @@ public class ItinkTest {
                 hostOrmText = reader.lines().collect(Collectors.joining("\n"));
             }
             assertTrue(hostOrmText.contains("target-entity=\"ru.thedevs.consumer.B\""), "Host orm.xml must contain target-entity ru.thedevs.consumer.B");
+            assertTrue(hostOrmText.contains("target-entity=\"ru.thedevs.consumer.ConsumerEntity\""), "Host orm.xml must contain target-entity ru.thedevs.consumer.ConsumerEntity");
         } else {
             // (3.6) Negative scenario (host without entities): ClassLoader returns original dependency descriptors untouched
             assertTrue(puText.contains("ru.thedevs.itink.ItinkEntity"), "Original persistence.xml must contain ItinkEntity");
@@ -998,6 +999,7 @@ def generateDescriptors = tasks.register('generateDescriptors') {
     <entity class="ru.thedevs.itink.ItinkEntity">
         <attributes>
             <many-to-one name="ref" target-entity="ru.thedevs.consumer.B"/>
+            <many-to-one name="consumerRef" target-entity="ru.thedevs.consumer.ConsumerEntity"/>
         </attributes>
     </entity>
 </entity-mappings>
@@ -1245,6 +1247,17 @@ fi
 
 if ! grep -q -- "(-1 entity entries superseded by host)" "$DOWNSTREAM_LOG"; then
   echo "FAIL: Gradle log missing '(-1 entity entries superseded by host)'" >&2
+  exit 1
+fi
+
+# TD-2521 / MOBI2-392: overlay check diagnostics for relationship targets
+if ! grep -q "\[TD-2521\] overlay check 'itink': .* listed=true root=" "$DOWNSTREAM_LOG"; then
+  echo "FAIL: Expected [TD-2521] overlay check 'itink' with listed=true in downstream log" >&2
+  exit 1
+fi
+
+if ! grep -q "\[TD-2521\] overlay check 'itink': .* listed=false root=missing" "$DOWNSTREAM_LOG"; then
+  echo "FAIL: Expected [TD-2521] overlay check 'itink' with listed=false root=missing in downstream log" >&2
   exit 1
 fi
 
