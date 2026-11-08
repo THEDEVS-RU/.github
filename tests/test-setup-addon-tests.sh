@@ -1313,6 +1313,27 @@ if ! grep -q "\[TD-2521\] overlay check 'itink': module entity ru.thedevs.transi
   exit 1
 fi
 
+# TD-2521 / MOBI2-392: candidate, merged-group, and listed entity diagnostics
+if ! grep -q "\[TD-2521\] overlay candidate 'itink': ru/thedevs/itink/persistence.xml root=itink-1.0.0.jar classes=1" "$DOWNSTREAM_LOG"; then
+  echo "FAIL: Expected [TD-2521] overlay candidate 'itink' root=itink-1.0.0.jar classes=1 in downstream log" >&2
+  exit 1
+fi
+
+if ! grep -q "::group::\[TD-2521\] merged 'itink': ru/thedevs/itink/persistence.xml (4 classes)" "$DOWNSTREAM_LOG"; then
+  echo "FAIL: Expected [TD-2521] merged 'itink' folded group in downstream log" >&2
+  exit 1
+fi
+
+if ! grep -q "\[TD-2521\] overlay check 'itink': listed class ru.thedevs.itink.ItinkEntity root=itink-1.0.0.jar entity=false" "$DOWNSTREAM_LOG"; then
+  echo "FAIL: Expected [TD-2521] overlay check for ItinkEntity entity=false in downstream log" >&2
+  exit 1
+fi
+
+if ! grep -q "\[TD-2521\] overlay check 'itink': ru/thedevs/itink/persistence.xml listed=4 entity-ok=0" "$DOWNSTREAM_LOG"; then
+  echo "FAIL: Expected [TD-2521] overlay check for itink listed=4 entity-ok=0 in downstream log" >&2
+  exit 1
+fi
+
 if ! grep -q '\[TD-2526\] testAddon_itink: jmix.core.additional-stores=' "$DOWNSTREAM_LOG"; then
   echo "FAIL: Expected [TD-2526] testAddon_itink: jmix.core.additional-stores= not found in downstream log" >&2
   exit 1
