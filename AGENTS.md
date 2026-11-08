@@ -90,6 +90,7 @@
 В логе Gradle задачи `buildHostPersistenceOverlay_<dep>` выводят диагностику:
 - `[TD-2521] Persistence overlay for '<dep>': <relPath> (+<N> host classes)` — сформирован объединённый дескриптор PU;
 - `[TD-2521] Persistence overlay for '<dep>': <mappingFile> (-<N> entity entries superseded by host)` — создана затеняющая копия mapping-файла;
+- `[TD-2521] overlay check '<dep>': <entity class>.<attribute> -> <target> listed=<true|false> root=<first classpath root, or 'missing'> super=<superclass> superRoot=<root>` — диагностика согласованности целевых сущностей связей (`many-to-one`, `one-to-one`, `one-to-many`, `many-to-many`) из mapping-файлов объединённого PU; фиксирует наличие целевого класса в `<class>` PU (`listed`), первый корень classpath с `.class` файлом цели (`root`) и корень direct superclass (`superRoot`).
 - Каталог на диске: `build/addon-tests/<dep>/persistence-overlay`.
 
 #### Компромиссы и риски

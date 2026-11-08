@@ -17,6 +17,7 @@ import org.gradle.api.tasks.bundling.Jar
 import org.gradle.api.tasks.testing.Test
 
 import java.io.ByteArrayInputStream
+import java.io.DataInputStream
 import java.nio.charset.StandardCharsets
 import java.util.zip.ZipFile
 import javax.xml.parsers.DocumentBuilderFactory
@@ -90,6 +91,111 @@ def writeXmlDocument(Document doc, File destFile) {
     destFile.withOutputStream { os ->
         tf.transform(new DOMSource(doc), new StreamResult(os))
     }
+}
+
+def readSuperClassNameFromClassBytes(byte[] bytes) {
+    if (bytes == null || bytes.length < 10) return null
+    try {
+        DataInputStream dis = new DataInputStream(new ByteArrayInputStream(bytes))
+        int magic = dis.readInt()
+        if (magic != 0xCAFEBABE) return null
+        int minor = dis.readUnsignedShort()
+        int major = dis.readUnsignedShort()
+        int cpCount = dis.readUnsignedShort()
+        Object[] cp = new Object[cpCount]
+        int i = 1
+        while (i < cpCount) {
+            int tag = dis.readUnsignedByte()
+            switch (tag) {
+                case 1: // CONSTANT_Utf8
+                    cp[i] = dis.readUTF()
+                    break
+                case 3: // CONSTANT_Integer
+                case 4: // CONSTANT_Float
+                    dis.skipBytes(4)
+                    break
+                case 5: // CONSTANT_Long
+                case 6: // CONSTANT_Double
+                    dis.skipBytes(8)
+                    i++
+                    break
+                case 7: // CONSTANT_Class
+                    cp[i] = dis.readUnsignedShort()
+                    break
+                case 8: // CONSTANT_String
+                case 16: // CONSTANT_MethodType
+                case 19: // CONSTANT_Module
+                case 20: // CONSTANT_Package
+                    dis.skipBytes(2)
+                    break
+                case 9: // CONSTANT_Fieldref
+                case 10: // CONSTANT_Methodref
+                case 11: // CONSTANT_InterfaceMethodref
+                case 12: // CONSTANT_NameAndType
+                case 17: // CONSTANT_Dynamic
+                case 18: // CONSTANT_InvokeDynamic
+                    dis.skipBytes(4)
+                    break
+                case 15: // CONSTANT_MethodHandle
+                    dis.skipBytes(3)
+                    break
+                default:
+                    return null
+            }
+            i++
+        }
+        dis.readUnsignedShort() // access_flags
+        dis.readUnsignedShort() // this_class
+        int superClass = dis.readUnsignedShort()
+        if (superClass > 0 && superClass < cpCount) {
+            def nameIndex = cp[superClass]
+            if (nameIndex instanceof Integer && nameIndex > 0 && nameIndex < cpCount) {
+                def name = cp[nameIndex]
+                if (name instanceof String) {
+                    return name.replace('/', '.')
+                }
+            }
+        }
+    } catch (Exception e) {
+        return null
+    }
+    return null
+}
+
+def formatClasspathRoot(File f, Project p) {
+    if (f == null) return 'missing'
+    if (f.isFile()) {
+        return f.name
+    }
+    try {
+        return p.rootProject.relativePath(f)
+    } catch (Exception e) {
+        return f.name
+    }
+}
+
+def findClassBytesInRoot(File root, String className) {
+    if (root == null || !root.exists() || className == null || className.isEmpty()) return null
+    String relPath = className.replace('.', '/') + '.class'
+    if (root.isDirectory()) {
+        File cf = new File(root, relPath)
+        if (cf.exists() && cf.isFile()) {
+            return cf.bytes
+        }
+    } else if (root.isFile() && (root.name.endsWith('.jar') || root.name.endsWith('.zip'))) {
+        try {
+            def zf = new ZipFile(root)
+            try {
+                def entry = zf.getEntry(relPath)
+                if (entry != null && !entry.isDirectory()) {
+                    return zf.getInputStream(entry).bytes
+                }
+            } finally {
+                zf.close()
+            }
+        } catch (Exception e) {}
+    }
+    return null
 }
 
 def resolveProjectTestLiquibaseChangelog(Project p) {
@@ -799,6 +905,12 @@ gradle.projectsEvaluated {
             def testAddon = p.tasks.maybeCreate(testTaskName, Test)
             testAddon.group = 'verification'
             testAddon.description = "Runs tests of dependency ${depGroup}:${baseModule}"
+            testAddon.testLogging {
+                events 'failed'
+                exceptionFormat = 'full'
+                showStackTraces = true
+                showCauses = true
+            }
 
             // 2. Unpack task and aggregate changelog generation
             def unpackTaskName = "unpackAddonTests_${baseModule}"
@@ -1019,6 +1131,25 @@ gradle.projectsEvaluated {
             // Extra output dirs registered via sourceSets.main.output.dir(...), e.g. Jmix-generated persistence.xml/orm.xml
             def starterGeneratedDirs = (starterProject != null && starterProject.pluginManager.hasPlugin('java')) ?
                 starterProject.sourceSets.main.output.dirs : p.files()
+
+            def mainResDir = p.layout.buildDirectory.dir("addon-tests/${baseModule}/host-resources/main")
+            def filterHostMainResources = p.tasks.maybeCreate("filterHostMainResources_${baseModule}", Sync)
+            filterHostMainResources.destinationDir = mainResDir.get().asFile
+            filterHostMainResources.from(p.tasks.named('processResources'))
+            filterHostMainResources.exclude 'META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports'
+            testAddon.dependsOn(filterHostMainResources)
+
+            def starterResDir = (starterProject != null && starterProject.pluginManager.hasPlugin('java')) ?
+                p.layout.buildDirectory.dir("addon-tests/${baseModule}/host-resources/starter") : null
+            if (starterResDir != null) {
+                def filterHostStarterResources = p.tasks.maybeCreate("filterHostStarterResources_${baseModule}", Sync)
+                filterHostStarterResources.destinationDir = starterResDir.get().asFile
+                filterHostStarterResources.from(starterProject.tasks.named('processResources'))
+                filterHostStarterResources.exclude 'META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports'
+                testAddon.dependsOn(filterHostStarterResources)
+            }
+
+            def hostResourcesDirs = [mainResDir] + (starterResDir != null ? [starterResDir] : [])
 
             // 4. Persistence unit overlay generation (TD-2521)
             def overlayDir = p.layout.buildDirectory.dir("addon-tests/${baseModule}/persistence-overlay").get().asFile
@@ -1361,27 +1492,156 @@ gradle.projectsEvaluated {
                         writeXmlDocument(mfDoc, mfTargetFile)
                         println "[TD-2521] Persistence overlay for '${baseModule}': ${mappingFile} (-${removedCount} entity entries superseded by host)"
                     }
+
+                    // Overlay consistency diagnostic (TD-2521 / MOBI2-392)
+                    def orderedRoots = []
+                    if (overlayDir.exists() && !p.fileTree(overlayDir).isEmpty()) {
+                        orderedRoots.add(overlayDir)
+                    }
+                    if (classesDir.exists()) {
+                        orderedRoots.add(classesDir)
+                    }
+                    if (aggregateFile.parentFile.exists()) {
+                        orderedRoots.add(aggregateFile.parentFile)
+                    }
+                    hostResourcesDirs.each { rd ->
+                        if (rd != null) {
+                            def rf = (rd instanceof File) ? rd : (rd.hasProperty('asFile') ? rd.asFile : new File(rd.toString()))
+                            if (rf.exists()) orderedRoots.add(rf)
+                        }
+                    }
+                    try {
+                        addonTestClasspath.files.each { rf ->
+                            if (rf.exists()) orderedRoots.add(rf)
+                        }
+                    } catch (Exception ignoredRootsEx) {}
+                    p.sourceSets.main.output.classesDirs.files.each { rf ->
+                        if (rf.exists()) orderedRoots.add(rf)
+                    }
+                    p.sourceSets.main.output.dirs.files.each { rf ->
+                        if (rf.exists()) orderedRoots.add(rf)
+                    }
+                    if (starterClassesDirs != null) {
+                        starterClassesDirs.files.each { rf ->
+                            if (rf.exists()) orderedRoots.add(rf)
+                        }
+                    }
+                    if (starterGeneratedDirs != null) {
+                        starterGeneratedDirs.files.each { rf ->
+                            if (rf.exists()) orderedRoots.add(rf)
+                        }
+                    }
+                    try {
+                        runtimeClasspath.files.each { rf ->
+                            if (rf.exists()) orderedRoots.add(rf)
+                        }
+                    } catch (Exception ignoredRootsEx) {}
+                    orderedRoots = orderedRoots.unique()
+
+                    def puClasses = new LinkedHashSet<String>(textValues(pu, "class"))
+                    def puMappingFiles = textValues(pu, "mapping-file")
+                    def relTags = ['many-to-one', 'one-to-one', 'one-to-many', 'many-to-many']
+                    def seenChecks = new LinkedHashSet<String>()
+
+                    puMappingFiles.each { mappingFile ->
+                        Document diagMfDoc = null
+                        File shadowMf = new File(overlayDir, mappingFile)
+                        if (shadowMf.exists() && shadowMf.isFile()) {
+                            try {
+                                diagMfDoc = shadowMf.withInputStream { is -> createSafeDocumentBuilder().parse(is) }
+                            } catch (Exception ignoredParseEx) {}
+                        }
+                        if (diagMfDoc == null) {
+                            File hostMf = hostOutputDirs.collect { new File(it, mappingFile) }.find { it.exists() && it.isFile() }
+                            if (hostMf != null) {
+                                try {
+                                    diagMfDoc = hostMf.withInputStream { is -> createSafeDocumentBuilder().parse(is) }
+                                } catch (Exception ignoredParseEx) {}
+                            }
+                        }
+                        if (diagMfDoc == null) {
+                            try {
+                                diagMfDoc = withResourceInputStream(mappingFile) { is -> createSafeDocumentBuilder().parse(is) }
+                            } catch (Exception ignoredParseEx) {}
+                        }
+
+                        if (diagMfDoc == null) return
+
+                        def rootEl = diagMfDoc.documentElement
+                        def entityNodes = rootEl.childNodes
+                        for (int ei = 0; ei < entityNodes.length; ei++) {
+                            def eNode = entityNodes.item(ei)
+                            if (eNode.nodeType == Node.ELEMENT_NODE) {
+                                def eEl = eNode as Element
+                                def eTag = localXmlTag(eEl)
+                                if (['entity', 'mapped-superclass', 'embeddable'].contains(eTag)) {
+                                    def entityClass = eEl.getAttribute('class')?.trim() ?: ''
+
+                                    def relElements = []
+                                    def collectRels
+                                    collectRels = { Node parentNode ->
+                                        def children = parentNode.childNodes
+                                        for (int ci = 0; ci < children.length; ci++) {
+                                            def ch = children.item(ci)
+                                            if (ch.nodeType == Node.ELEMENT_NODE) {
+                                                def chEl = ch as Element
+                                                def chTag = localXmlTag(chEl)
+                                                if (relTags.contains(chTag)) {
+                                                    relElements.add(chEl)
+                                                } else {
+                                                    collectRels(chEl)
+                                                }
+                                            }
+                                        }
+                                    }
+                                    collectRels(eEl)
+
+                                    relElements.each { relEl ->
+                                        def attrName = relEl.getAttribute('name')?.trim() ?: ''
+                                        def target = relEl.getAttribute('target-entity')?.trim() ?: ''
+                                        if (target) {
+                                            def checkKey = "${entityClass}.${attrName}->${target}"
+                                            if (seenChecks.add(checkKey)) {
+                                                boolean isListed = puClasses.contains(target)
+
+                                                File targetFoundRoot = null
+                                                byte[] targetBytes = null
+                                                for (File r : orderedRoots) {
+                                                    byte[] b = findClassBytesInRoot(r, target)
+                                                    if (b != null) {
+                                                        targetFoundRoot = r
+                                                        targetBytes = b
+                                                        break
+                                                    }
+                                                }
+
+                                                if (targetFoundRoot != null) {
+                                                    String targetRoot = formatClasspathRoot(targetFoundRoot, p)
+                                                    String superClass = readSuperClassNameFromClassBytes(targetBytes)
+                                                    String superRoot = 'missing'
+                                                    if (superClass != null) {
+                                                        for (File r : orderedRoots) {
+                                                            byte[] b = findClassBytesInRoot(r, superClass)
+                                                            if (b != null) {
+                                                                superRoot = formatClasspathRoot(r, p)
+                                                                break
+                                                            }
+                                                        }
+                                                    }
+                                                    println "[TD-2521] overlay check '${baseModule}': ${entityClass}.${attrName} -> ${target} listed=${isListed} root=${targetRoot} super=${superClass ?: 'none'} superRoot=${superRoot}"
+                                                } else {
+                                                    println "[TD-2521] overlay check '${baseModule}': ${entityClass}.${attrName} -> ${target} listed=${isListed} root=missing"
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
 
-            def mainResDir = p.layout.buildDirectory.dir("addon-tests/${baseModule}/host-resources/main")
-            def filterHostMainResources = p.tasks.maybeCreate("filterHostMainResources_${baseModule}", Sync)
-            filterHostMainResources.destinationDir = mainResDir.get().asFile
-            filterHostMainResources.from(p.tasks.named('processResources'))
-            filterHostMainResources.exclude 'META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports'
-            testAddon.dependsOn(filterHostMainResources)
-
-            def starterResDir = (starterProject != null && starterProject.pluginManager.hasPlugin('java')) ?
-                p.layout.buildDirectory.dir("addon-tests/${baseModule}/host-resources/starter") : null
-            if (starterResDir != null) {
-                def filterHostStarterResources = p.tasks.maybeCreate("filterHostStarterResources_${baseModule}", Sync)
-                filterHostStarterResources.destinationDir = starterResDir.get().asFile
-                filterHostStarterResources.from(starterProject.tasks.named('processResources'))
-                filterHostStarterResources.exclude 'META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports'
-                testAddon.dependsOn(filterHostStarterResources)
-            }
-
-            def hostResourcesDirs = [mainResDir] + (starterResDir != null ? [starterResDir] : [])
             testAddon.classpath = p.files({
                 if (testState.skippedPreRollout || testState.testsDisabled) {
                     return p.files()
