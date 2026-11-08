@@ -1207,6 +1207,9 @@ gradle.projectsEvaluated {
             overlayTask.inputs.files(starterGeneratedDirs)
             overlayTask.inputs.files(classesDir)
             overlayTask.inputs.files(addonTestClasspath.incoming.artifactView { lenient(true) }.files)
+            if (runtimeClasspath != null) {
+                overlayTask.inputs.files(runtimeClasspath)
+            }
             overlayTask.outputs.dir(overlayDir)
             overlayTask.dependsOn(unpackTask)
             testAddon.dependsOn(overlayTask)
@@ -1303,7 +1306,7 @@ gradle.projectsEvaluated {
                 // 2. Candidate Roots in Dependency (classpath order)
                 def depRoots = []
                 if (classesDir.exists() && classesDir.isDirectory()) {
-                    depRoots.add([type: 'dir', file: classesDir])
+                    depRoots.add([type: 'dir', file: classesDir, source: 'dependency'])
                 }
                 try {
                     def artifactGroupMap = [:]
@@ -1313,11 +1316,31 @@ gradle.projectsEvaluated {
                     addonTestClasspath.files.each { f ->
                         def grp = artifactGroupMap[f.absolutePath] ?: ''
                         if (grp.startsWith('ru.thedevs') && f.exists() && f.isFile() && f.name.endsWith('.jar')) {
-                            depRoots.add([type: 'jar', file: f])
+                            depRoots.add([type: 'jar', file: f, source: 'dependency'])
                         }
                     }
                 } catch (Exception e) {
                     println "::warning::[TD-2521] Could not resolve artifact groups for candidate roots: ${e.message}"
+                }
+                try {
+                    if (runtimeClasspath != null) {
+                        def hostRuntimeGroupMap = [:]
+                        runtimeClasspath.resolvedConfiguration.resolvedArtifacts.each { art ->
+                            hostRuntimeGroupMap[art.file.absolutePath] = art.moduleVersion?.id?.group ?: ''
+                        }
+                        def existingRootPaths = new HashSet<String>(depRoots.collect { it.file.absolutePath })
+                        runtimeClasspath.files.each { f ->
+                            def grp = hostRuntimeGroupMap[f.absolutePath] ?: ''
+                            if (grp.startsWith('ru.thedevs') && f.exists() && f.isFile() && f.name.endsWith('.jar')) {
+                                if (!existingRootPaths.contains(f.absolutePath)) {
+                                    depRoots.add([type: 'jar', file: f, source: 'host-runtime'])
+                                    existingRootPaths.add(f.absolutePath)
+                                }
+                            }
+                        }
+                    }
+                } catch (Exception e) {
+                    println "::warning::[TD-2521] Could not resolve host runtime artifacts for candidate roots: ${e.message}"
                 }
 
                 def candidatesByRelPath = new LinkedHashMap<String, Map>()
@@ -1370,9 +1393,9 @@ gradle.projectsEvaluated {
                 }
 
                 candidatesByRelPath.values().each { cand ->
-                    println "[TD-2521] overlay candidate '${baseModule}': ${cand.relPath} root=${formatClasspathRoot(cand.root.file as File, p)} classes=${cand.classesCount}"
+                    println "[TD-2521] overlay candidate '${baseModule}': ${cand.relPath} root=${formatClasspathRoot(cand.root.file as File, p)} classes=${cand.classesCount} source=${cand.root.source}"
                     cand.shadowed?.each { sc ->
-                        println "[TD-2521] overlay candidate '${baseModule}': ${cand.relPath} shadowed copy root=${formatClasspathRoot(sc.root.file as File, p)} classes=${sc.classesCount}"
+                        println "[TD-2521] overlay candidate '${baseModule}': ${cand.relPath} shadowed copy root=${formatClasspathRoot(sc.root.file as File, p)} classes=${sc.classesCount} source=${sc.root.source}"
                     }
                 }
 

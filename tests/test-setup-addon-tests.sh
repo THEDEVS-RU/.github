@@ -33,6 +33,7 @@ include 'nested-lib'
 include 'nomodprops'
 include 'topodep-mod'
 include 'managed-lib'
+include 'hostruntime-lib'
 EOF
 
 cat > "$UPSTREAM_DIR/build.gradle" <<'EOF'
@@ -284,6 +285,16 @@ public class ItinkTest {
                     "Host descriptor must not be modified by overlay (no ru/thedevs/itink/orm.xml)");
             assertFalse(hostPuText.contains("ru.thedevs.itink.ItinkConverter"),
                     "Host descriptor must not be modified by overlay (no ItinkConverter)");
+
+            // Hostruntime descriptor ru/thedevs/hostruntime/persistence.xml merged and lists ItinkEntity
+            URL hrPuUrl = getClass().getClassLoader().getResource("ru/thedevs/hostruntime/persistence.xml");
+            assertNotNull(hrPuUrl, "Hostruntime descriptor ru/thedevs/hostruntime/persistence.xml must be resolvable via ClassLoader");
+            String hrPuText;
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(hrPuUrl.openStream(), StandardCharsets.UTF_8))) {
+                hrPuText = reader.lines().collect(Collectors.joining("\n"));
+            }
+            assertTrue(hrPuText.contains("ru.thedevs.itink.ItinkEntity"), "Merged hostruntime persistence.xml must contain ItinkEntity");
+            assertTrue(hrPuText.contains("ru.thedevs.hostruntime.HostruntimeEntity"), "Merged hostruntime persistence.xml must contain HostruntimeEntity");
 
             // (3.5) Conflict fixture: ru/thedevs/itink/orm.xml does NOT contain ItinkEntity, but DOES contain ItinkOnlyEntity
             assertFalse(ormText.contains("ru.thedevs.itink.ItinkEntity"), "Shadowed orm.xml must not contain ItinkEntity superseded by host");
@@ -575,7 +586,45 @@ publishing {
 }
 EOF
 
-mkdir -p "$UPSTREAM_DIR/nomodprops/src/main/resources/ru/thedevs/nomodprops/liquibase"
+# TD-2521 / MOBI2-392 upstream fixture: hostruntime-lib (runtimeClasspath-only module descriptor)
+mkdir -p "$UPSTREAM_DIR/hostruntime-lib/src/main/java/ru/thedevs/hostruntime"
+cat > "$UPSTREAM_DIR/hostruntime-lib/src/main/java/ru/thedevs/hostruntime/HostruntimeEntity.java" <<'EOF'
+package ru.thedevs.hostruntime;
+public class HostruntimeEntity {
+}
+EOF
+
+mkdir -p "$UPSTREAM_DIR/hostruntime-lib/src/main/resources/ru/thedevs/hostruntime"
+cat > "$UPSTREAM_DIR/hostruntime-lib/src/main/resources/ru/thedevs/hostruntime/persistence.xml" <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<persistence xmlns="http://xmlns.jcp.org/xml/ns/persistence" version="2.2">
+    <persistence-unit name="main">
+        <provider>io.jmix.data.impl.JmixPersistenceProvider</provider>
+        <class>ru.thedevs.hostruntime.HostruntimeEntity</class>
+        <exclude-unlisted-classes/>
+    </persistence-unit>
+</persistence>
+EOF
+
+cat > "$UPSTREAM_DIR/hostruntime-lib/build.gradle" <<EOF
+plugins {
+    id 'java-library'
+    id 'maven-publish'
+}
+publishing {
+    publications {
+        javaMaven(MavenPublication) {
+            from components.java
+        }
+    }
+    repositories {
+        maven {
+            name = 'localRepo'
+            url = uri("${REPO_DIR}")
+        }
+    }
+}
+EOF
 cat > "$UPSTREAM_DIR/nomodprops/src/main/resources/ru/thedevs/nomodprops/liquibase/changelog.xml" <<'EOF'
 <?xml version="1.0" encoding="UTF-8"?>
 <databaseChangeLog
@@ -677,8 +726,8 @@ EOF
 echo "Building and publishing upstream fixtures via ci-addon-tests.init.gradle..."
 (
   cd "$UPSTREAM_DIR"
-  # Publish itink-mod, upstream-starter, helper-test, transit-lib, nested-lib, nomodprops, topodep-mod, managed-lib via ci-addon-tests.init.gradle
-  gradle -I "$INIT_SCRIPT" :nested-lib:publishAllPublicationsToLocalRepoRepository :transit-lib:publishAllPublicationsToLocalRepoRepository :nomodprops:publishAllPublicationsToLocalRepoRepository :topodep-mod:publishAllPublicationsToLocalRepoRepository :managed-lib:publishAllPublicationsToLocalRepoRepository :itink-mod:publishAllPublicationsToLocalRepoRepository :upstream-starter:publishAllPublicationsToLocalRepoRepository :helper-test:publishAllPublicationsToLocalRepoRepository --no-daemon
+  # Publish itink-mod, upstream-starter, helper-test, transit-lib, nested-lib, nomodprops, topodep-mod, managed-lib, hostruntime-lib via ci-addon-tests.init.gradle
+  gradle -I "$INIT_SCRIPT" :nested-lib:publishAllPublicationsToLocalRepoRepository :transit-lib:publishAllPublicationsToLocalRepoRepository :hostruntime-lib:publishAllPublicationsToLocalRepoRepository :nomodprops:publishAllPublicationsToLocalRepoRepository :topodep-mod:publishAllPublicationsToLocalRepoRepository :managed-lib:publishAllPublicationsToLocalRepoRepository :itink-mod:publishAllPublicationsToLocalRepoRepository :upstream-starter:publishAllPublicationsToLocalRepoRepository :helper-test:publishAllPublicationsToLocalRepoRepository --no-daemon
   # Publish sample-lib WITHOUT init script so it has NO -tests artifact published
   gradle :sample-lib:publishAllPublicationsToLocalRepoRepository --no-daemon
 )
@@ -1010,6 +1059,7 @@ plugins {
 dependencies {
     implementation 'ru.thedevs:upstream-starter:1.0.0'
     implementation 'ru.thedevs:topodep:1.0.0'
+    implementation 'ru.thedevs:hostruntime-lib:1.0.0'
     testImplementation 'org.junit.jupiter:junit-jupiter-api:5.10.2'
     testRuntimeOnly 'org.junit.jupiter:junit-jupiter-engine:5.10.2'
     testRuntimeOnly 'org.junit.platform:junit-platform-launcher:1.10.2'
@@ -1273,6 +1323,16 @@ if [ ! -f "$OVERLAY_ORM" ]; then
   exit 1
 fi
 
+OVERLAY_HR="$DOWNSTREAM_DIR/consumer-mod/build/addon-tests/itink/persistence-overlay/ru/thedevs/hostruntime/persistence.xml"
+if [ ! -f "$OVERLAY_HR" ]; then
+  echo "FAIL: Overlay ru/thedevs/hostruntime/persistence.xml was not created at $OVERLAY_HR" >&2
+  exit 1
+fi
+if ! grep -q "ItinkEntity" "$OVERLAY_HR"; then
+  echo "FAIL: Overlay ru/thedevs/hostruntime/persistence.xml does not contain ItinkEntity" >&2
+  exit 1
+fi
+
 # Verify original published itink-1.0.0.jar is intact
 ORIG_PU_FILE="$TEST_DIR/orig-pu.xml"
 unzip -p "$REPO_DIR/ru/thedevs/itink/1.0.0/itink-1.0.0.jar" ru/thedevs/itink/persistence.xml > "$ORIG_PU_FILE"
@@ -1303,8 +1363,8 @@ if ! grep -q "\[TD-2521\] overlay check 'itink': ru.thedevs.itink.ItinkEntity.ch
 fi
 
 # MOBI2-392: module entities union assertions
-if ! grep -q "\[TD-2521\] Persistence overlay for 'itink': ru/thedevs/itink/persistence.xml (+1 module classes)" "$DOWNSTREAM_LOG"; then
-  echo "FAIL: Expected [TD-2521] Persistence overlay for 'itink' (+1 module classes) in downstream log" >&2
+if ! grep -q "\[TD-2521\] Persistence overlay for 'itink': ru/thedevs/itink/persistence.xml (+2 module classes)" "$DOWNSTREAM_LOG"; then
+  echo "FAIL: Expected [TD-2521] Persistence overlay for 'itink' (+2 module classes) in downstream log" >&2
   exit 1
 fi
 
@@ -1314,12 +1374,22 @@ if ! grep -q "\[TD-2521\] overlay check 'itink': module entity ru.thedevs.transi
 fi
 
 # TD-2521 / MOBI2-392: candidate, merged-group, and listed entity diagnostics
-if ! grep -q "\[TD-2521\] overlay candidate 'itink': ru/thedevs/itink/persistence.xml root=itink-1.0.0.jar classes=1" "$DOWNSTREAM_LOG"; then
-  echo "FAIL: Expected [TD-2521] overlay candidate 'itink' root=itink-1.0.0.jar classes=1 in downstream log" >&2
+if ! grep -q "\[TD-2521\] overlay candidate 'itink': ru/thedevs/itink/persistence.xml root=itink-1.0.0.jar classes=1 source=dependency" "$DOWNSTREAM_LOG"; then
+  echo "FAIL: Expected [TD-2521] overlay candidate 'itink' root=itink-1.0.0.jar classes=1 source=dependency in downstream log" >&2
   exit 1
 fi
 
-if ! grep -q "::group::\[TD-2521\] merged 'itink': ru/thedevs/itink/persistence.xml (4 classes)" "$DOWNSTREAM_LOG"; then
+if ! grep -q "\[TD-2521\] overlay candidate 'itink': ru/thedevs/hostruntime/persistence.xml root=hostruntime-lib-1.0.0.jar classes=1 source=host-runtime" "$DOWNSTREAM_LOG"; then
+  echo "FAIL: Expected [TD-2521] overlay candidate 'itink' for hostruntime in downstream log" >&2
+  exit 1
+fi
+
+if ! grep -q "\[TD-2521\] Persistence overlay for 'itink': ru/thedevs/hostruntime/persistence.xml (+2 host classes)" "$DOWNSTREAM_LOG"; then
+  echo "FAIL: Expected [TD-2521] Persistence overlay for 'itink': ru/thedevs/hostruntime/persistence.xml (+2 host classes) in downstream log" >&2
+  exit 1
+fi
+
+if ! grep -q "::group::\[TD-2521\] merged 'itink': ru/thedevs/itink/persistence.xml (5 classes)" "$DOWNSTREAM_LOG"; then
   echo "FAIL: Expected [TD-2521] merged 'itink' folded group in downstream log" >&2
   exit 1
 fi
@@ -1329,8 +1399,8 @@ if ! grep -q "\[TD-2521\] overlay check 'itink': listed class ru.thedevs.itink.I
   exit 1
 fi
 
-if ! grep -q "\[TD-2521\] overlay check 'itink': ru/thedevs/itink/persistence.xml listed=4 entity-ok=0" "$DOWNSTREAM_LOG"; then
-  echo "FAIL: Expected [TD-2521] overlay check for itink listed=4 entity-ok=0 in downstream log" >&2
+if ! grep -q "\[TD-2521\] overlay check 'itink': ru/thedevs/itink/persistence.xml listed=5 entity-ok=0" "$DOWNSTREAM_LOG"; then
+  echo "FAIL: Expected [TD-2521] overlay check for itink listed=5 entity-ok=0 in downstream log" >&2
   exit 1
 fi
 
