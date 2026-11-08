@@ -88,9 +88,11 @@
 
 #### Диагностика
 В логе Gradle задачи `buildHostPersistenceOverlay_<dep>` выводят диагностику:
-- `[TD-2521] Persistence overlay for '<dep>': <relPath> (+<N> host classes)` — сформирован объединённый дескриптор PU;
+- `[TD-2521] Persistence overlay for '<dep>': <relPath> (+<N> host classes)` — сформирован объединённый дескриптор PU с добавлением сущностей хоста;
+- `[TD-2521] Persistence overlay for '<dep>': <relPath> (+<N> module classes)` — в объединённый дескриптор добавлены недостающие классы сущностей из других Jmix-модулей зависимости того же хранилища (MOBI2-392);
 - `[TD-2521] Persistence overlay for '<dep>': <mappingFile> (-<N> entity entries superseded by host)` — создана затеняющая копия mapping-файла;
-- `[TD-2521] overlay check '<dep>': <entity class>.<attribute> -> <target> listed=<true|false> root=<first classpath root, or 'missing'> super=<superclass> superRoot=<root>` — диагностика согласованности целевых сущностей связей (`many-to-one`, `one-to-one`, `one-to-many`, `many-to-many`) из mapping-файлов объединённого PU; фиксирует наличие целевого класса в `<class>` PU (`listed`), первый корень classpath с `.class` файлом цели (`root`) и корень direct superclass (`superRoot`).
+- `[TD-2521] overlay check '<dep>': <entity class>.<attribute> -> <target> listed=<true|false> root=<first classpath root, or 'missing'> super=<superclass> superRoot=<root>` — диагностика согласованности целевых сущностей связей (`many-to-one`, `one-to-one`, `one-to-many`, `many-to-many`) из mapping-файлов объединённого PU; фиксирует наличие целевого класса в `<class>` PU (`listed`), первый корень classpath с `.class` файлом цели (`root`) и корень direct superclass (`superRoot`). Значение `superRoot=missing` является ожидаемым для суперклассов JDK, таких как `java.lang.Object`;
+- `[TD-2521] overlay check '<dep>': module entity <class> added to <relPath> from <source relPath>@<root>` — диагностика добавления сущности модуля в объединённый дескриптор (покрывает связи, аннотированные в Java-классах и отсутствующие в `orm.xml`).
 - Каталог на диске: `build/addon-tests/<dep>/persistence-overlay`.
 
 #### Компромиссы и риски
