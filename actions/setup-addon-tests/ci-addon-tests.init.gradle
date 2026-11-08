@@ -1315,6 +1315,36 @@ gradle.projectsEvaluated {
                 // 3 & 4. Merge candidates and create shadowing copies of mapping files
                 def processedMappingFiles = new LinkedHashSet<String>()
 
+                // Collect union of classes across all module descriptors in candidatesByRelPath per store file name (MOBI2-392)
+                def moduleClassesByStoreFileName = new LinkedHashMap<String, Map<String, Map>>()
+                candidatesByRelPath.values().each { cand ->
+                    Document candDoc = null
+                    try {
+                        candDoc = withResourceInputStream(cand.relPath) { is ->
+                            createSafeDocumentBuilder().parse(is)
+                        }
+                    } catch (Exception e) {
+                        println "::warning::[TD-2521] Failed to parse candidate descriptor '${cand.relPath}' for module classes union: ${e.message}"
+                    }
+                    if (candDoc != null) {
+                        def puNodes = candDoc.getElementsByTagName("persistence-unit")
+                        if (puNodes.length > 0) {
+                            def puEl = puNodes.item(0) as Element
+                            def classes = textValues(puEl, "class")
+                            def storeClassesMap = moduleClassesByStoreFileName.computeIfAbsent(cand.fileName, { k -> new LinkedHashMap<String, Map>() })
+                            classes.each { cls ->
+                                if (cls && !storeClassesMap.containsKey(cls)) {
+                                    storeClassesMap.put(cls, [
+                                        className: cls,
+                                        sourceRelPath: cand.relPath,
+                                        sourceRoot: cand.root
+                                    ])
+                                }
+                            }
+                        }
+                    }
+                }
+
                 matchingCandidates.each { candidateRelPath, cand ->
                     def storeName = cand.fileName
                     def hostInfo = hostDescriptorsByFileName[storeName]
@@ -1364,6 +1394,23 @@ gradle.projectsEvaluated {
                                 pu.appendChild(newCls)
                             }
                             addedHostClasses++
+                        }
+                    }
+
+                    def storeModuleClasses = moduleClassesByStoreFileName[storeName] ?: [:]
+                    def addedModuleEntities = new LinkedHashMap<String, Map>()
+                    storeModuleClasses.values().each { modInfo ->
+                        def modCls = modInfo.className
+                        if (!depClasses.contains(modCls) && !hostInfo.classes.contains(modCls)) {
+                            def newCls = doc.createElementNS(pu.namespaceURI, "class")
+                            newCls.textContent = modCls
+                            def refNode = findInsertBefore(pu, classInsertBeforeTags)
+                            if (refNode != null) {
+                                pu.insertBefore(newCls, refNode)
+                            } else {
+                                pu.appendChild(newCls)
+                            }
+                            addedModuleEntities.put(modCls, modInfo)
                         }
                     }
 
@@ -1420,6 +1467,9 @@ gradle.projectsEvaluated {
                     def targetFile = new File(overlayDir, candidateRelPath)
                     writeXmlDocument(doc, targetFile)
                     println "[TD-2521] Persistence overlay for '${baseModule}': ${candidateRelPath} (+${addedHostClasses} host classes)"
+                    if (addedModuleEntities.size() > 0) {
+                        println "[TD-2521] Persistence overlay for '${baseModule}': ${candidateRelPath} (+${addedModuleEntities.size()} module classes)"
+                    }
 
                     // Shadowing copies of dependency mapping files
                     depMappingFiles.each { mappingFile ->
@@ -1470,99 +1520,105 @@ gradle.projectsEvaluated {
                     }
 
                     // Overlay consistency diagnostic (TD-2521 / MOBI2-392)
-                    def orderedRoots = []
-                    if (overlayDir.exists() && !p.fileTree(overlayDir).isEmpty()) {
-                        orderedRoots.add(overlayDir)
-                    }
-                    if (classesDir.exists()) {
-                        orderedRoots.add(classesDir)
-                    }
-                    if (aggregateFile.parentFile.exists()) {
-                        orderedRoots.add(aggregateFile.parentFile)
-                    }
-                    p.files(hostResourcesDirs).files.each { rf ->
-                        if (rf != null && rf.exists()) orderedRoots.add(rf)
-                    }
-                    try {
-                        addonTestClasspath.files.each { rf ->
-                            if (rf != null && rf.exists()) orderedRoots.add(rf)
-                        }
-                    } catch (Exception e) {
-                        println "::warning::[TD-2521] Could not resolve addonTestClasspath files: ${e.message}"
-                    }
-                    p.sourceSets.main.output.classesDirs.files.each { rf ->
-                        if (rf != null && rf.exists()) orderedRoots.add(rf)
-                    }
-                    p.sourceSets.main.output.dirs.files.each { rf ->
-                        if (rf != null && rf.exists()) orderedRoots.add(rf)
-                    }
-                    if (starterClassesDirs != null) {
-                        starterClassesDirs.files.each { rf ->
-                            if (rf != null && rf.exists()) orderedRoots.add(rf)
-                        }
-                    }
-                    if (starterGeneratedDirs != null) {
-                        starterGeneratedDirs.files.each { rf ->
-                            if (rf != null && rf.exists()) orderedRoots.add(rf)
-                        }
-                    }
-                    try {
-                        runtimeClasspath.files.each { rf ->
-                            if (rf != null && rf.exists()) orderedRoots.add(rf)
-                        }
-                    } catch (Exception e) {
-                        println "::warning::[TD-2521] Could not resolve runtimeClasspath files: ${e.message}"
-                    }
-                    orderedRoots = orderedRoots.unique()
-
-                    def puClasses = new LinkedHashSet<String>(textValues(pu, "class"))
-                    def puMappingFiles = textValues(pu, "mapping-file")
-                    def relTags = ['many-to-one', 'one-to-one', 'one-to-many', 'many-to-many']
-                    def seenChecks = new LinkedHashSet<String>()
-
                     Map<File, ZipFile> openZipFiles = new LinkedHashMap<>()
-                    Map<String, Map> classResolutionCache = new LinkedHashMap<>()
-
-                    def resolveClassEntry = { String className ->
-                        if (className == null || className.isEmpty()) return null
-                        if (classResolutionCache.containsKey(className)) {
-                            return classResolutionCache[className]
+                    try {
+                        def orderedRoots = []
+                        if (overlayDir.exists() && !p.fileTree(overlayDir).isEmpty()) {
+                            orderedRoots.add(overlayDir)
                         }
-
-                        String relPath = className.replace('.', '/') + '.class'
-                        File targetFoundRoot = null
-                        byte[] targetBytes = null
-
-                        for (File r : orderedRoots) {
-                            if (!r.exists()) continue
-                            if (r.isDirectory()) {
-                                File cf = new File(r, relPath)
-                                if (cf.exists() && cf.isFile()) {
-                                    targetFoundRoot = r
-                                    targetBytes = cf.bytes
-                                    break
-                                }
-                            } else if (r.isFile() && (r.name.endsWith('.jar') || r.name.endsWith('.zip'))) {
-                                try {
-                                    ZipFile zf = openZipFiles.computeIfAbsent(r, { f -> new ZipFile(f) })
-                                    def entry = zf.getEntry(relPath)
-                                    if (entry != null && !entry.isDirectory()) {
-                                        targetFoundRoot = r
-                                        targetBytes = zf.getInputStream(entry).bytes
-                                        break
-                                    }
-                                } catch (Exception e) {
-                                    println "::warning::[TD-2521] Failed to read ${className} from archive ${r.path}: ${e.message}"
-                                }
+                        if (classesDir.exists()) {
+                            orderedRoots.add(classesDir)
+                        }
+                        if (aggregateFile.parentFile.exists()) {
+                            orderedRoots.add(aggregateFile.parentFile)
+                        }
+                        p.files(hostResourcesDirs).files.each { rf ->
+                            if (rf != null && rf.exists()) orderedRoots.add(rf)
+                        }
+                        try {
+                            addonTestClasspath.files.each { rf ->
+                                if (rf != null && rf.exists()) orderedRoots.add(rf)
+                            }
+                        } catch (Exception e) {
+                            println "::warning::[TD-2521] Could not resolve addonTestClasspath files: ${e.message}"
+                        }
+                        p.sourceSets.main.output.classesDirs.files.each { rf ->
+                            if (rf != null && rf.exists()) orderedRoots.add(rf)
+                        }
+                        p.sourceSets.main.output.dirs.files.each { rf ->
+                            if (rf != null && rf.exists()) orderedRoots.add(rf)
+                        }
+                        if (starterClassesDirs != null) {
+                            starterClassesDirs.files.each { rf ->
+                                if (rf != null && rf.exists()) orderedRoots.add(rf)
                             }
                         }
+                        if (starterGeneratedDirs != null) {
+                            starterGeneratedDirs.files.each { rf ->
+                                if (rf != null && rf.exists()) orderedRoots.add(rf)
+                            }
+                        }
+                        try {
+                            runtimeClasspath.files.each { rf ->
+                                if (rf != null && rf.exists()) orderedRoots.add(rf)
+                            }
+                        } catch (Exception e) {
+                            println "::warning::[TD-2521] Could not resolve runtimeClasspath files: ${e.message}"
+                        }
+                        orderedRoots = orderedRoots.unique()
 
-                        def res = [foundRoot: targetFoundRoot, bytes: targetBytes]
-                        classResolutionCache[className] = res
-                        return res
-                    }
+                        // Module entities diagnostic (MOBI2-392)
+                        addedModuleEntities.each { modCls, modInfo ->
+                            String sourceRootStr = formatClasspathRoot(modInfo.sourceRoot?.file as File, p)
+                            println "[TD-2521] overlay check '${baseModule}': module entity ${modCls} added to ${candidateRelPath} from ${modInfo.sourceRelPath}@${sourceRootStr}"
+                        }
 
-                    try {
+                        def puClasses = new LinkedHashSet<String>(textValues(pu, "class"))
+                        def puMappingFiles = textValues(pu, "mapping-file")
+                        def relTags = ['many-to-one', 'one-to-one', 'one-to-many', 'many-to-many']
+                        def seenChecks = new LinkedHashSet<String>()
+
+                        Map<String, Map> classResolutionCache = new LinkedHashMap<>()
+
+                        def resolveClassEntry = { String className ->
+                            if (className == null || className.isEmpty()) return null
+                            if (classResolutionCache.containsKey(className)) {
+                                return classResolutionCache[className]
+                            }
+
+                            String relPath = className.replace('.', '/') + '.class'
+                            File targetFoundRoot = null
+                            byte[] targetBytes = null
+
+                            for (File r : orderedRoots) {
+                                if (!r.exists()) continue
+                                if (r.isDirectory()) {
+                                    File cf = new File(r, relPath)
+                                    if (cf.exists() && cf.isFile()) {
+                                        targetFoundRoot = r
+                                        targetBytes = cf.bytes
+                                        break
+                                    }
+                                } else if (r.isFile() && (r.name.endsWith('.jar') || r.name.endsWith('.zip'))) {
+                                    try {
+                                        ZipFile zf = openZipFiles.computeIfAbsent(r, { f -> new ZipFile(f) })
+                                        def entry = zf.getEntry(relPath)
+                                        if (entry != null && !entry.isDirectory()) {
+                                            targetFoundRoot = r
+                                            targetBytes = zf.getInputStream(entry).bytes
+                                            break
+                                        }
+                                    } catch (Exception e) {
+                                        println "::warning::[TD-2521] Failed to read ${className} from archive ${r.path}: ${e.message}"
+                                    }
+                                }
+                            }
+
+                            def res = [foundRoot: targetFoundRoot, bytes: targetBytes]
+                            classResolutionCache[className] = res
+                            return res
+                        }
+
                         puMappingFiles.each { mappingFile ->
                             Document diagMfDoc = null
                             File shadowMf = new File(overlayDir, mappingFile)
@@ -1654,6 +1710,8 @@ gradle.projectsEvaluated {
                                 }
                             }
                         }
+                    } catch (Exception e) {
+                        println "::warning::[TD-2521] overlay check failed: ${e.message}"
                     } finally {
                         openZipFiles.values().each { zf ->
                             try { zf.close() } catch (Exception ignoredCloseEx) {}

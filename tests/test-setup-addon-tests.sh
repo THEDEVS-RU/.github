@@ -252,6 +252,9 @@ public class ItinkTest {
             assertEquals(1, countConsumerCls, "Exactly one occurrence of <class>ru.thedevs.consumer.ConsumerEntity</class>");
             int countChildCls = (puText.length() - puText.replace("<class>ru.thedevs.consumer.ConsumerChildEntity</class>", "").length()) / "<class>ru.thedevs.consumer.ConsumerChildEntity</class>".length();
             assertEquals(1, countChildCls, "Exactly one occurrence of <class>ru.thedevs.consumer.ConsumerChildEntity</class>");
+            assertTrue(puText.contains("ru.thedevs.transit.TransitEntity"), "Merged persistence.xml must contain TransitEntity from transit-lib");
+            int countTransitCls = (puText.length() - puText.replace("<class>ru.thedevs.transit.TransitEntity</class>", "").length()) / "<class>ru.thedevs.transit.TransitEntity</class>".length();
+            assertEquals(1, countTransitCls, "Exactly one occurrence of <class>ru.thedevs.transit.TransitEntity</class>");
 
             // (3.3.b, d) converters-list contains elements of dependency and host, separated by ;, without duplicates
             assertTrue(puText.contains("ru.thedevs.itink.ItinkConverter"), "Converters list must contain ItinkConverter");
@@ -507,6 +510,25 @@ publishing {
         }
     }
 }
+EOF
+
+mkdir -p "$UPSTREAM_DIR/transit-lib/src/main/java/ru/thedevs/transit"
+cat > "$UPSTREAM_DIR/transit-lib/src/main/java/ru/thedevs/transit/TransitEntity.java" <<'EOF'
+package ru.thedevs.transit;
+public class TransitEntity {
+}
+EOF
+
+mkdir -p "$UPSTREAM_DIR/transit-lib/src/main/resources/ru/thedevs/transit"
+cat > "$UPSTREAM_DIR/transit-lib/src/main/resources/ru/thedevs/transit/persistence.xml" <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<persistence xmlns="http://xmlns.jcp.org/xml/ns/persistence" version="2.2">
+    <persistence-unit name="main">
+        <provider>io.jmix.data.impl.JmixPersistenceProvider</provider>
+        <class>ru.thedevs.transit.TransitEntity</class>
+        <exclude-unlisted-classes/>
+    </persistence-unit>
+</persistence>
 EOF
 
 mkdir -p "$UPSTREAM_DIR/transit-lib/src/main/resources/ru/thedevs/transit/liquibase"
@@ -1277,6 +1299,17 @@ fi
 
 if ! grep -q "\[TD-2521\] overlay check 'itink': ru.thedevs.itink.ItinkEntity.childRef -> ru.thedevs.consumer.ConsumerChildEntity listed=true root=consumer-mod/build/classes/java/main super=ru.thedevs.consumer.ConsumerEntity superRoot=consumer-mod/build/classes/java/main" "$DOWNSTREAM_LOG"; then
   echo "FAIL: Expected [TD-2521] overlay check for ConsumerChildEntity listed=true super=ConsumerEntity superRoot=consumer-mod/build/classes/java/main in downstream log" >&2
+  exit 1
+fi
+
+# MOBI2-392: module entities union assertions
+if ! grep -q "\[TD-2521\] Persistence overlay for 'itink': ru/thedevs/itink/persistence.xml (+1 module classes)" "$DOWNSTREAM_LOG"; then
+  echo "FAIL: Expected [TD-2521] Persistence overlay for 'itink' (+1 module classes) in downstream log" >&2
+  exit 1
+fi
+
+if ! grep -q "\[TD-2521\] overlay check 'itink': module entity ru.thedevs.transit.TransitEntity added to ru/thedevs/itink/persistence.xml from ru/thedevs/transit/persistence.xml@transit-lib-1.0.0.jar" "$DOWNSTREAM_LOG"; then
+  echo "FAIL: Expected [TD-2521] overlay check for module entity TransitEntity added in downstream log" >&2
   exit 1
 fi
 
