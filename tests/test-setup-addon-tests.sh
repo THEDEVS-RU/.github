@@ -241,6 +241,7 @@ public class ItinkTest {
             // exactly one occurrence of each class, and exclude-unlisted-classes
             assertTrue(puText.contains("ru.thedevs.itink.ItinkEntity"), "Merged persistence.xml must contain ItinkEntity");
             assertTrue(puText.contains("ru.thedevs.consumer.ConsumerEntity"), "Merged persistence.xml must contain ConsumerEntity");
+            assertTrue(puText.contains("ru.thedevs.consumer.ConsumerChildEntity"), "Merged persistence.xml must contain ConsumerChildEntity");
             assertTrue(puText.contains("ru/thedevs/itink/orm.xml"), "Merged persistence.xml must contain itink orm.xml");
             assertTrue(puText.contains("ru/thedevs/consumer/orm.xml"), "Merged persistence.xml must contain consumer orm.xml");
             assertTrue(puText.contains("<exclude-unlisted-classes"), "Merged persistence.xml must contain exclude-unlisted-classes");
@@ -249,6 +250,8 @@ public class ItinkTest {
             assertEquals(1, countItinkCls, "Exactly one occurrence of <class>ru.thedevs.itink.ItinkEntity</class>");
             int countConsumerCls = (puText.length() - puText.replace("<class>ru.thedevs.consumer.ConsumerEntity</class>", "").length()) / "<class>ru.thedevs.consumer.ConsumerEntity</class>".length();
             assertEquals(1, countConsumerCls, "Exactly one occurrence of <class>ru.thedevs.consumer.ConsumerEntity</class>");
+            int countChildCls = (puText.length() - puText.replace("<class>ru.thedevs.consumer.ConsumerChildEntity</class>", "").length()) / "<class>ru.thedevs.consumer.ConsumerChildEntity</class>".length();
+            assertEquals(1, countChildCls, "Exactly one occurrence of <class>ru.thedevs.consumer.ConsumerChildEntity</class>");
 
             // (3.3.b, d) converters-list contains elements of dependency and host, separated by ;, without duplicates
             assertTrue(puText.contains("ru.thedevs.itink.ItinkConverter"), "Converters list must contain ItinkConverter");
@@ -266,6 +269,8 @@ public class ItinkTest {
             }
             assertTrue(hostPuText.contains("ru.thedevs.consumer.ConsumerEntity"),
                     "Host descriptor must contain ConsumerEntity");
+            assertTrue(hostPuText.contains("ru.thedevs.consumer.ConsumerChildEntity"),
+                    "Host descriptor must contain ConsumerChildEntity");
             assertTrue(hostPuText.contains("ru/thedevs/consumer/orm.xml"),
                     "Host descriptor must contain ru/thedevs/consumer/orm.xml");
             assertTrue(hostPuText.contains("ru.thedevs.consumer.ConsumerConverter"),
@@ -290,6 +295,7 @@ public class ItinkTest {
             }
             assertTrue(hostOrmText.contains("target-entity=\"ru.thedevs.consumer.B\""), "Host orm.xml must contain target-entity ru.thedevs.consumer.B");
             assertTrue(hostOrmText.contains("target-entity=\"ru.thedevs.consumer.ConsumerEntity\""), "Host orm.xml must contain target-entity ru.thedevs.consumer.ConsumerEntity");
+            assertTrue(hostOrmText.contains("target-entity=\"ru.thedevs.consumer.ConsumerChildEntity\""), "Host orm.xml must contain target-entity ru.thedevs.consumer.ConsumerChildEntity");
         } else {
             // (3.6) Negative scenario (host without entities): ClassLoader returns original dependency descriptors untouched
             assertTrue(puText.contains("ru.thedevs.itink.ItinkEntity"), "Original persistence.xml must contain ItinkEntity");
@@ -921,6 +927,12 @@ public class ConsumerEntity {
 }
 EOF
 
+cat > "$DOWNSTREAM_DIR/consumer-mod/src/main/java/ru/thedevs/consumer/ConsumerChildEntity.java" <<'EOF'
+package ru.thedevs.consumer;
+public class ConsumerChildEntity extends ConsumerEntity {
+}
+EOF
+
 cat > "$DOWNSTREAM_DIR/consumer-mod/src/main/java/ru/thedevs/consumer/ConsumerMainAutoConfiguration.java" <<'EOF'
 package ru.thedevs.consumer;
 public class ConsumerMainAutoConfiguration {
@@ -1000,6 +1012,7 @@ def generateDescriptors = tasks.register('generateDescriptors') {
         <attributes>
             <many-to-one name="ref" target-entity="ru.thedevs.consumer.B"/>
             <many-to-one name="consumerRef" target-entity="ru.thedevs.consumer.ConsumerEntity"/>
+            <many-to-one name="childRef" target-entity="ru.thedevs.consumer.ConsumerChildEntity"/>
         </attributes>
     </entity>
 </entity-mappings>
@@ -1012,6 +1025,7 @@ def generateDescriptors = tasks.register('generateDescriptors') {
         <provider>io.jmix.data.impl.JmixPersistenceProvider</provider>
         <mapping-file>ru/thedevs/consumer/orm.xml</mapping-file>
         <class>ru.thedevs.consumer.ConsumerEntity</class>
+        <class>ru.thedevs.consumer.ConsumerChildEntity</class>
         <exclude-unlisted-classes/>
         <properties>
             <property name="eclipselink.weaving" value="static"/>
@@ -1251,13 +1265,18 @@ if ! grep -q -- "(-1 entity entries superseded by host)" "$DOWNSTREAM_LOG"; then
 fi
 
 # TD-2521 / MOBI2-392: overlay check diagnostics for relationship targets
-if ! grep -q "\[TD-2521\] overlay check 'itink': .* listed=true root=" "$DOWNSTREAM_LOG"; then
-  echo "FAIL: Expected [TD-2521] overlay check 'itink' with listed=true in downstream log" >&2
+if ! grep -q "\[TD-2521\] overlay check 'itink': ru.thedevs.itink.ItinkEntity.ref -> ru.thedevs.consumer.B listed=false root=missing" "$DOWNSTREAM_LOG"; then
+  echo "FAIL: Expected [TD-2521] overlay check for B listed=false root=missing in downstream log" >&2
   exit 1
 fi
 
-if ! grep -q "\[TD-2521\] overlay check 'itink': .* listed=false root=missing" "$DOWNSTREAM_LOG"; then
-  echo "FAIL: Expected [TD-2521] overlay check 'itink' with listed=false root=missing in downstream log" >&2
+if ! grep -q "\[TD-2521\] overlay check 'itink': ru.thedevs.itink.ItinkEntity.consumerRef -> ru.thedevs.consumer.ConsumerEntity listed=true root=consumer-mod/build/classes/java/main super=java.lang.Object superRoot=missing" "$DOWNSTREAM_LOG"; then
+  echo "FAIL: Expected [TD-2521] overlay check for ConsumerEntity listed=true super=java.lang.Object superRoot=missing in downstream log" >&2
+  exit 1
+fi
+
+if ! grep -q "\[TD-2521\] overlay check 'itink': ru.thedevs.itink.ItinkEntity.childRef -> ru.thedevs.consumer.ConsumerChildEntity listed=true root=consumer-mod/build/classes/java/main super=ru.thedevs.consumer.ConsumerEntity superRoot=consumer-mod/build/classes/java/main" "$DOWNSTREAM_LOG"; then
+  echo "FAIL: Expected [TD-2521] overlay check for ConsumerChildEntity listed=true super=ConsumerEntity superRoot=consumer-mod/build/classes/java/main in downstream log" >&2
   exit 1
 fi
 
