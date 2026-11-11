@@ -26,3 +26,7 @@ jobs:
         run: bash tests/test-kaniko-build.sh
       - name: Run Contract Tests
         run: bash tests/test-setup-addon-tests.sh
+      - name: Run Addon Report Security Contract Tests
+        run: bash tests/test-addon-test-reports.sh
+      - name: Run Addon Observation Hook Smoke
+        run: bash tests/test-addon-test-observation.sh

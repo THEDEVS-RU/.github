@@ -7,10 +7,18 @@ inputs:
     required: false
     default: 'false'
 
+  observability:
+    description: Export read-only local test observability init script
+    default: 'false'
+
 outputs:
   init_script:
     description: 'Absolute path to canonical ci-addon-tests.init.gradle'
     value: ${{ steps.export.outputs.init_script }}
+
+  observability_init_script:
+    description: Absolute path to optional observation init script
+    value: ${{ steps.export.outputs.observability_init_script }}
 
 runs:
   using: 'composite'
@@ -18,15 +26,25 @@ runs:
     - name: Export init script path
       id: export
       shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+        STRICT_INPUT: ${{ inputs.strict }}
+        OBSERVABILITY_INPUT: ${{ inputs.observability }}
       run: |
-        SCRIPT_PATH="${{ github.action_path }}/ci-addon-tests.init.gradle"
+        SCRIPT_PATH="$ACTION_PATH/ci-addon-tests.init.gradle"
         if [ ! -f "$SCRIPT_PATH" ]; then
           echo "::error::Init script not found at $SCRIPT_PATH"
           exit 1
         fi
         echo "init_script=$SCRIPT_PATH" >> "$GITHUB_OUTPUT"
         echo "THEDEVS_ADDON_TESTS_INIT=$SCRIPT_PATH" >> "$GITHUB_ENV"
-        if [ "${{ inputs.strict }}" = "true" ] || [ "${{ env.THEDEVS_TESTS_STRICT }}" = "true" ]; then
+        if [ "$STRICT_INPUT" = "true" ] || [ "${THEDEVS_TESTS_STRICT:-false}" = "true" ]; then
           echo "THEDEVS_TESTS_STRICT=true" >> "$GITHUB_ENV"
         fi
         echo "Canonical addon tests init script located at: $SCRIPT_PATH"
+        if [ "$OBSERVABILITY_INPUT" = "true" ]; then
+          OBSERVATION_PATH="$ACTION_PATH/test-observability.init.gradle"
+          test -f "$OBSERVATION_PATH"
+          echo "observability_init_script=$OBSERVATION_PATH" >> "$GITHUB_OUTPUT"
+          echo "THEDEVS_ADDON_TESTS_OBSERVABILITY_INIT=$OBSERVATION_PATH" >> "$GITHUB_ENV"
+        fi

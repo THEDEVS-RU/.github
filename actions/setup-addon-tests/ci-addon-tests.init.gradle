@@ -825,6 +825,28 @@ gradle.allprojects { p ->
     }
 }
 
+// TD-2844: read-only candidate state journal; disabled unless observation is requested.
+def recordAddonObservation = { p, coordinate, state, artifactFile = null ->
+    def lane = System.getenv('THEDEVS_TEST_LANE')
+    if (System.getenv('THEDEVS_ADDON_TESTS_OBSERVABILITY_INIT') && lane in ['own', 'dependencies']) {
+        def directory = new File(p.rootProject.layout.buildDirectory.get().asFile, "addon-test-observability/${lane}")
+        directory.mkdirs()
+        def file = new File(directory, 'dependencies.jsonl')
+        synchronized (gradle) {
+            def record = [project: p.path, coordinate: coordinate, state: state]
+            if (artifactFile != null) {
+                def digest = java.security.MessageDigest.getInstance('SHA-256')
+                artifactFile.withInputStream { input ->
+                    byte[] buffer = new byte[65536]; int length
+                    while ((length = input.read(buffer)) > 0) digest.update(buffer, 0, length)
+                }
+                record.sha256 = digest.digest().encodeHex().toString()
+            }
+            file.append(groovy.json.JsonOutput.toJson(record) + '\n')
+        }
+    }
+}
+
 // 2.2 - 2.5. Dependency resolution, starter mapping and isolated testAddon_* tasks in gradle.projectsEvaluated
 gradle.projectsEvaluated {
     gradle.allprojects { p ->
@@ -985,6 +1007,8 @@ gradle.projectsEvaluated {
             unpackTask.outputs.dir(classesDir)
             unpackTask.outputs.file(aggregateFile)
 
+            def observationCoordinate = "${depGroup}:${baseModule}-tests:${depVersion}".toString()
+            recordAddonObservation(p, observationCoordinate, 'discovered')
             def testState = [testsDisabled: false, skippedPreRollout: false]
 
             unpackTask.doLast {
@@ -1057,6 +1081,7 @@ gradle.projectsEvaluated {
                         throw new GradleException("[TD-2039] Strict mode enabled: tests artifact '${depGroup}:${baseModule}-tests:${depVersion}' was not found. Tests artifact must be published or marked with thedevs.tests.disabled=true in the descriptor.")
                     } else {
                         println "::warning::[TD-2039] Skipped dependency tests for '${depGroup}:${baseModule}': tests artifact not yet published (pre-rollout)."
+                        recordAddonObservation(p, observationCoordinate, 'missing-artifact-pre-rollout')
                         testState.skippedPreRollout = true
                         testAddon.enabled = false
                         return
@@ -1076,11 +1101,14 @@ gradle.projectsEvaluated {
                         throw new GradleException("[TD-2039] Strict mode enabled: tests artifact jar '${depGroup}:${baseModule}-tests:${depVersion}' not found.")
                     } else {
                         println "::warning::[TD-2039] Skipped dependency tests for '${depGroup}:${baseModule}': tests artifact not yet published (pre-rollout)."
+                        recordAddonObservation(p, observationCoordinate, 'missing-artifact-pre-rollout')
                         testState.skippedPreRollout = true
                         testAddon.enabled = false
                         return
                     }
                 }
+
+                recordAddonObservation(p, observationCoordinate, 'artifact-resolved', testsJarArtifact.file)
 
                 // Sync classes cleanly to eliminate stale files
                 p.sync {
@@ -1096,6 +1124,7 @@ gradle.projectsEvaluated {
 
                 if ('true'.equalsIgnoreCase(depProps.getProperty('thedevs.tests.disabled'))) {
                     println "[TD-2039] Dependency '${depGroup}:${baseModule}' marked with thedevs.tests.disabled=true. No tests to run."
+                    recordAddonObservation(p, observationCoordinate, 'descriptor-disabled')
                     testState.testsDisabled = true
                     testAddon.enabled = false
                 }
