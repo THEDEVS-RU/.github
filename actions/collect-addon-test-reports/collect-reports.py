@@ -40,9 +40,21 @@ def conventional(path):
     return bool(re.fullmatch(r'(?:[^/]+/)*build/(?:test-results(?:/[^/]+)*|reports/tests(?:/[^/]+)*|reports/profile(?:/[^/]+)*|addon-test-observability/(?:own|dependencies)(?:/[^/]+)*)', text))
 
 
+def prohibited_report_name(name):
+    lowered = name.lower()
+    return (
+        lowered.startswith('.')
+        or Path(lowered).stem in {'credentials', 'credential', 'kubeconfig', 'environment', 'env', 'system-properties', 'system_properties'}
+        or lowered in {'gradle.properties', 'application.properties', 'application.yml', 'application.yaml'}
+        or lowered.endswith(('.env', '.pem', '.key', '.jks', '.log', '.properties'))
+    )
+
+
 def checked(checkout, relative):
     path = checkout
     for part in relative.parts:
+        if prohibited_report_name(part):
+            raise Unsafe('prohibited credential/environment report path')
         path = path / part
         if path.is_symlink():
             raise Unsafe('symlink report path')
@@ -77,7 +89,7 @@ def report_entries(checkout, root):
                 if stat.S_ISLNK(metadata.st_mode):
                     raise Unsafe('symlink report descendant')
                 if name in directories:
-                    if name.startswith('.') or name.lower() in {'credentials', 'kubeconfig', 'environment'}:
+                    if prohibited_report_name(name):
                         raise Unsafe('prohibited report directory')
                     continue
                 if not stat.S_ISREG(metadata.st_mode):
@@ -88,11 +100,8 @@ def report_entries(checkout, root):
 
 
 def permitted_file(path):
-    lowered = path.name.lower()
-    if path.stem.lower() in {'credentials', 'credential', 'kubeconfig', 'environment', 'env', 'system-properties', 'system_properties'}:
+    if prohibited_report_name(path.name):
         raise Unsafe('prohibited credential/environment report file')
-    if lowered.startswith('.') or lowered in {'kubeconfig', 'credentials', 'gradle.properties', 'application.properties', 'application.yml', 'application.yaml'} or lowered.endswith(('.env', '.pem', '.key', '.jks', '.log', '.properties')):
-        raise Unsafe('prohibited report file')
     if path.suffix.lower() not in {'.xml', '.html', '.htm', '.css', '.js', '.json', '.jsonl', '.png', '.svg', '.gif', '.ico', '.woff', '.woff2', '.ttf'}:
         raise Unsafe('unexpected report file type')
 
