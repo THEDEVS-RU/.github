@@ -3,6 +3,7 @@
 import collections
 import datetime
 import html
+from html.parser import HTMLParser
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -11,6 +12,7 @@ import shutil
 import stat
 import sys
 import tempfile
+from urllib.parse import unquote, urlsplit
 import xml.parsers.expat as expat
 
 
@@ -63,8 +65,32 @@ def open_report(checkout, relative):
         os.close(descriptor)
 
 
+def report_entries(checkout, root):
+    descriptor = os.open(checkout, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        for part in root.parts:
+            next_descriptor = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=descriptor)
+            os.close(descriptor); descriptor = next_descriptor
+        for parent, directories, names, parent_descriptor in os.fwalk('.', dir_fd=descriptor, follow_symlinks=False):
+            for name in directories + names:
+                metadata = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+                if stat.S_ISLNK(metadata.st_mode):
+                    raise Unsafe('symlink report descendant')
+                if name in directories:
+                    if name.startswith('.') or name.lower() in {'credentials', 'kubeconfig', 'environment'}:
+                        raise Unsafe('prohibited report directory')
+                    continue
+                if not stat.S_ISREG(metadata.st_mode):
+                    raise Unsafe('nonregular report file')
+                yield root / PurePosixPath(parent) / name
+    finally:
+        os.close(descriptor)
+
+
 def permitted_file(path):
     lowered = path.name.lower()
+    if path.stem.lower() in {'credentials', 'credential', 'kubeconfig', 'environment', 'env', 'system-properties', 'system_properties'}:
+        raise Unsafe('prohibited credential/environment report file')
     if lowered.startswith('.') or lowered in {'kubeconfig', 'credentials', 'gradle.properties', 'application.properties', 'application.yml', 'application.yaml'} or lowered.endswith(('.env', '.pem', '.key', '.jks', '.log', '.properties')):
         raise Unsafe('prohibited report file')
     if path.suffix.lower() not in {'.xml', '.html', '.htm', '.css', '.js', '.json', '.jsonl', '.png', '.svg', '.gif', '.ico', '.woff', '.woff2', '.ttf'}:
@@ -122,6 +148,34 @@ def parse_xml(path):
     return dict(cases), classes, cache, sorted(starts)
 
 
+def validate_html_assets(staging, report, root, files):
+    class References(HTMLParser):
+        def handle_starttag(self, tag, attributes):
+            for name, value in attributes:
+                if name not in {'href', 'src'} or not value:
+                    continue
+                url = urlsplit(html.unescape(value))
+                if url.scheme in {'http', 'https', 'mailto', 'data'} or url.netloc:
+                    continue
+                if url.scheme:
+                    raise Unsafe('unsafe report asset URL')
+                path = unquote(url.path)
+                if not path:
+                    continue
+                if path.startswith('/') or '\\' in path:
+                    raise Unsafe('unsafe report asset path')
+                target = (report.parent / path).resolve()
+                if not target.is_relative_to(staging / root):
+                    raise Unsafe('report asset outside report tree')
+                if str(target.relative_to(staging)) not in files:
+                    raise ValueError('missing referenced report asset')
+    parser = References(convert_charrefs=True)
+    with report.open(encoding='utf-8', errors='strict') as source:
+        while chunk := source.read(65536):
+            parser.feed(chunk)
+    parser.close()
+
+
 def collect(env):
     checkout = Path(env.get('GITHUB_WORKSPACE', os.getcwd())).resolve()
     staging = Path(tempfile.mkdtemp(prefix='addon-tests-', dir=env['RUNNER_TEMP']))
@@ -142,18 +196,8 @@ def collect(env):
                 continue
             if not directory.is_dir():
                 raise Unsafe('report root is not directory')
-            for parent, directories, names in os.walk(directory, followlinks=False):
-                for name in directories + names:
-                    candidate = Path(parent) / name
-                    if candidate.is_symlink():
-                        raise Unsafe('symlink report descendant')
-                    if name in directories:
-                        if name.startswith('.') or name.lower() in {'credentials', 'kubeconfig', 'environment'}:
-                            raise Unsafe('prohibited report directory')
-                        continue
-                    if not stat.S_ISREG(candidate.lstat().st_mode):
-                        raise Unsafe('nonregular report file')
-                    relative = candidate.relative_to(checkout)
+            for relative in report_entries(checkout, root):
+                    candidate = checkout / relative
                     if '/test-results/' in str(relative) and 'binary' in relative.parts and candidate.name in {'output.bin', 'output.bin.idx', 'results.bin'}:
                         continue
                     permitted_file(candidate)
@@ -227,6 +271,13 @@ def collect(env):
                     available = [path for name, path in files.items() if PurePosixPath(name).is_relative_to(location)]
                     if task.get('state') in {'success', 'failure'} and not available:
                         errors.append('missing executed-task ' + kind)
+                    if kind == 'html' and task.get('state') in {'success', 'failure'}:
+                        index = str(location / 'index.html')
+                        if index not in files:
+                            errors.append('missing executed-task HTML index')
+                        for path in available:
+                            if path.suffix.lower() in {'.html', '.htm'}:
+                                validate_html_assets(staging, path, location, files)
                     if kind == 'xml':
                         for path in available:
                             if path.suffix == '.xml':
@@ -243,7 +294,7 @@ def collect(env):
                     errors.append('reports for unexecuted task')
                 if task.get('state') in {'running', 'scheduled'}:
                     errors.append('incomplete task')
-                if task.get('state') == 'success' and sum(task_counts.values()) == 0:
+                if task.get('state') in {'success', 'failure'} and sum(task_counts.values()) == 0:
                     errors.append('executed-empty task')
                 task['reportCounts'] = dict(task_counts)
                 task['distinctClasses'] = len(classes)
@@ -262,6 +313,9 @@ def collect(env):
                 errors.append('unowned or duplicate XML report')
             if manifest.get('phase') not in {'complete', 'failure'}:
                 errors.append('incomplete phase')
+        for name, path in files.items():
+            if name.startswith('build/reports/profile/') and path.suffix.lower() in {'.html', '.htm'}:
+                validate_html_assets(staging, path, PurePosixPath('build/reports/profile'), files)
         if not any(name.startswith('build/reports/profile/') and name.endswith('.html') for name in files):
             errors.append('missing Gradle profile')
         if env.get('REPORT_TEST_OUTCOME') not in {'success', 'failure'}:
@@ -270,7 +324,7 @@ def collect(env):
         unsafe = True; errors.append(str(exc))
     except OSError:
         unsafe = True; errors.append('unsafe or unreadable report path')
-    except (ValueError, KeyError, TypeError, AttributeError, expat.ExpatError):
+    except (ValueError, KeyError, TypeError, AttributeError, UnicodeError, expat.ExpatError):
         tasks = []; manifest = {}; counts.clear()
         errors.append('malformed or unreadable report metadata/XML')
     if unsafe:
