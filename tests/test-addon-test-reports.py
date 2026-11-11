@@ -98,6 +98,23 @@ class Reports(unittest.TestCase):
             self.assertEqual('false', self.collect()[1]['ready'])
             path.unlink()
 
+    def test_credential_and_environment_directories_rejected(self):
+        original_roots = self.env['REPORT_ROOTS']
+        for name in ('credentials', 'credential.json', 'kubeconfig', 'environment', 'env',
+                     'system-properties', 'system_properties', 'gradle.properties', 'application.yml'):
+            path = self.write('module/build/reports/tests/headlessTest/' + name + '/dump.json', '{}')
+            # Reject the directory both as a descendant and when supplied as an
+            # explicit report root; neither traversal route may bypass policy.
+            for roots in (original_roots, str(path.parent.relative_to(self.checkout)) + '\n' + original_roots):
+                self.env['REPORT_ROOTS'] = roots
+                result, values, summary = self.collect()
+                self.assertEqual(1, result, name)
+                self.assertEqual('false', values['ready'], name)
+                self.assertEqual('', values['artifact-path'], name)
+                self.assertIn('Reports:', summary)
+            self.env['REPORT_ROOTS'] = original_roots
+            path.unlink(); path.parent.rmdir()
+
     def test_binary_outputs_are_never_staged(self):
         for name in ('output.bin', 'output.bin.idx', 'results.bin', 'results-generic.bin', 'output-events.bin'):
             self.write('module/build/test-results/headlessTest/binary/' + name, 'binary')
