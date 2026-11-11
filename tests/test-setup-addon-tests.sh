@@ -1764,3 +1764,10 @@ fi
 echo "Scenario E: PASSED"
 
 echo "=== All Contract Tests for setup-addon-tests PASSED ==="
+
+# Optional observation is additive; no change to TD-2039 strict/publication surface.
+OBSERVATION_SCRIPT="${SCRIPT_DIR}/../actions/setup-addon-tests/test-observability.init.gradle"
+test -f "$OBSERVATION_SCRIPT"
+grep -q 'default: '\''false'\''' "${SCRIPT_DIR}/../actions/setup-addon-tests/action.yml"
+grep -q 'THEDEVS_ADDON_TESTS_OBSERVABILITY_INIT' "${SCRIPT_DIR}/../actions/setup-addon-tests/action.yml"
+grep -q "state: 'scheduled'" "$OBSERVATION_SCRIPT"

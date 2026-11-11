@@ -1,0 +1,113 @@
+import groovy.json.JsonOutput
+import org.gradle.api.tasks.testing.Test
+import java.time.Instant
+
+// Local observation only: never changes scheduling, discovery, forks or classpaths.
+def lane = System.getenv('THEDEVS_TEST_LANE')
+if (!(lane in ['own', 'dependencies'])) throw new GradleException('THEDEVS_TEST_LANE must be own or dependencies')
+def records = Collections.synchronizedMap(new LinkedHashMap())
+def artifactHashes = [:]
+def phaseStart = System.nanoTime()
+def phaseUtc = Instant.now().toString()
+def root
+def relative = { File f ->
+    def base = gradle.rootProject.projectDir.toPath().toAbsolutePath().normalize()
+    def path = f.toPath().toAbsolutePath().normalize()
+    if (!path.startsWith(base)) throw new GradleException('Observation report path outside repository')
+    base.relativize(path).toString().replace(File.separator, '/')
+}
+def writeManifest = { String phase ->
+    synchronized (records) {
+        root.mkdirs()
+        def manifest = [schemaVersion: 1, lane: lane, phase: phase, startedAt: phaseUtc,
+                        elapsedNanos: System.nanoTime() - phaseStart, observedAt: Instant.now().toString(),
+                        endedAt: phase in ['complete', 'failure'] ? Instant.now().toString() : null,
+                        tasks: records.values().toList()]
+        def target = new File(root, 'manifest.json')
+        def temporary = new File(root, 'manifest.json.tmp')
+        temporary.text = JsonOutput.toJson(manifest)
+        java.nio.file.Files.move(temporary.toPath(), target.toPath(), java.nio.file.StandardCopyOption.REPLACE_EXISTING)
+    }
+}
+gradle.projectsEvaluated {
+    root = new File(gradle.rootProject.layout.buildDirectory.get().asFile, "addon-test-observability/${lane}")
+    gradle.allprojects { p ->
+        p.tasks.withType(Test).configureEach { t ->
+            t.systemProperty('logging.level.org.springframework.test.context.cache', 'DEBUG')
+            t.doFirst {
+                synchronized (records) {
+                    def r = records[t.path]
+                    if (r != null) {
+                        r.state = 'running'; r.startedAt = Instant.now().toString(); r.startedNanos = System.nanoTime()
+                        // Coordinates/content hashes only; never serialize classpaths or credentials.
+                        def fingerprints = []
+                        (['runtimeClasspath', 'testRuntimeClasspath'] + (t.name.startsWith('testAddon_') ? ['addonTestClasspath_' + t.name.substring('testAddon_'.length())] : [])).each { configName ->
+                            def config = t.project.configurations.findByName(configName)
+                            if (config != null && config.state.toString() != 'UNRESOLVED') {
+                                config.resolvedConfiguration.resolvedArtifacts.each { artifact ->
+                                    def cacheKey = [artifact.file.absolutePath, artifact.file.length(), artifact.file.lastModified()]
+                                    def contentHash = artifactHashes[cacheKey]
+                                    if (contentHash == null) {
+                                        def digest = java.security.MessageDigest.getInstance('SHA-256')
+                                        artifact.file.withInputStream { input ->
+                                            byte[] buffer = new byte[65536]; int length
+                                            while ((length = input.read(buffer)) > 0) digest.update(buffer, 0, length)
+                                        }
+                                        contentHash = digest.digest().encodeHex().toString()
+                                        artifactHashes[cacheKey] = contentHash
+                                    }
+                                    fingerprints.add([coordinate: artifact.moduleVersion.id.toString(),
+                                                      artifact: artifact.name, classifier: artifact.classifier,
+                                                      sha256: contentHash])
+                                }
+                            }
+                        }
+                        r.resolvedArtifacts = fingerprints.unique().sort { a, b -> a.coordinate <=> b.coordinate }
+                        r.maxHeapSize = t.maxHeapSize; r.maxParallelForks = t.maxParallelForks; r.forkEvery = t.forkEvery
+                        writeManifest('running')
+                    }
+                }
+            }
+            t.afterSuite { descriptor, result ->
+                synchronized (records) {
+                    new File(root, 'suites.jsonl').append(JsonOutput.toJson([
+                        task: t.path, name: descriptor.name, className: descriptor.className,
+                        parent: descriptor.parent?.name, parentClass: descriptor.parent?.className,
+                        startedAtMillis: result.startTime, endedAtMillis: result.endTime,
+                        durationMillis: result.endTime - result.startTime, timing: 'overlaps-task-wall',
+                        tests: result.testCount, passed: result.successfulTestCount,
+                        failed: result.failedTestCount, skipped: result.skippedTestCount]) + '\n')
+                    if (descriptor.parent == null && records[t.path] != null) {
+                        records[t.path].counts = [tests: result.testCount, passed: result.successfulTestCount,
+                                                 failed: result.failedTestCount, skipped: result.skippedTestCount]
+                        writeManifest('running')
+                    }
+                }
+            }
+        }
+    }
+}
+gradle.taskGraph.whenReady { graph ->
+    graph.allTasks.findAll { it instanceof Test }.each { t ->
+        records[t.path] = [path: t.path, project: relative(t.project.projectDir),
+            build: relative(t.project.layout.buildDirectory.get().asFile), state: 'scheduled',
+            xml: relative(t.reports.junitXml.outputLocation.get().asFile),
+            html: relative(t.reports.html.outputLocation.get().asFile),
+            maxHeapSize: t.maxHeapSize, maxParallelForks: t.maxParallelForks, forkEvery: t.forkEvery]
+    }
+    writeManifest('scheduled')
+}
+gradle.taskGraph.afterTask { t, state ->
+    if (t instanceof Test) synchronized (records) {
+        def r = records[t.path]
+        if (r != null) {
+            r.state = state.failure ? 'failure' : state.noSource ? 'no-source' : state.skipped ? 'skipped' : 'success'
+            r.endedAt = Instant.now().toString()
+            if (r.startedNanos != null) { r.elapsedNanos = System.nanoTime() - r.remove('startedNanos') }
+            writeManifest('running')
+        }
+    }
+}
+gradle.buildFinished { result ->
+    if (root != null) { writeManifest(result.failure ? 'failure' : 'complete') }
+}

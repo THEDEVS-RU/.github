@@ -1,0 +1,59 @@
+name: Collect addon test reports
+description: Validate and stage explicit local reports before a separate bounded upload
+inputs:
+  lane:
+    description: lane for bounded local report collection
+    required: true
+  manifest:
+    description: manifest for bounded local report collection
+    required: true
+  test-outcome:
+    description: test outcome for bounded local report collection
+    required: true
+  report-roots:
+    description: report roots for bounded local report collection
+    required: true
+  run-id:
+    description: run id for bounded local report collection
+    required: true
+  run-attempt:
+    description: run attempt for bounded local report collection
+    required: true
+  head-sha:
+    description: head sha for bounded local report collection
+    required: true
+  action-sha:
+    description: action sha for bounded local report collection
+    required: true
+outputs:
+  artifact-path:
+    description: artifact path for bounded local report collection
+    value: ${{ steps.collect.outputs.artifact-path }}
+  artifact-name:
+    description: artifact name for bounded local report collection
+    value: ${{ steps.collect.outputs.artifact-name }}
+  ready:
+    description: ready for bounded local report collection
+    value: ${{ steps.collect.outputs.ready }}
+  complete:
+    description: complete for bounded local report collection
+    value: ${{ steps.collect.outputs.complete }}
+  prepared-at:
+    description: prepared at for bounded local report collection
+    value: ${{ steps.collect.outputs.prepared-at }}
+runs:
+  using: composite
+  steps:
+    - id: collect
+      shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+        REPORT_LANE: ${{ inputs.lane }}
+        REPORT_MANIFEST: ${{ inputs.manifest }}
+        REPORT_TEST_OUTCOME: ${{ inputs.test-outcome }}
+        REPORT_ROOTS: ${{ inputs.report-roots }}
+        REPORT_RUN_ID: ${{ inputs.run-id }}
+        REPORT_RUN_ATTEMPT: ${{ inputs.run-attempt }}
+        REPORT_HEAD_SHA: ${{ inputs.head-sha }}
+        REPORT_ACTION_SHA: ${{ inputs.action-sha }}
+      run: python3 "$ACTION_PATH/collect-reports.py"
