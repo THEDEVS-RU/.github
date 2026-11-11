@@ -99,10 +99,11 @@ class Reports(unittest.TestCase):
             path.unlink()
 
     def test_binary_outputs_are_never_staged(self):
-        self.write('module/build/test-results/headlessTest/binary/output.bin', 'binary')
+        for name in ('output.bin', 'output.bin.idx', 'results.bin', 'results-generic.bin', 'output-events.bin'):
+            self.write('module/build/test-results/headlessTest/binary/' + name, 'binary')
         result, values, _ = self.collect()
         self.assertEqual(0, result)
-        self.assertFalse((Path(values['artifact-path']) / 'module/build/test-results/headlessTest/binary/output.bin').exists())
+        self.assertFalse((Path(values['artifact-path']) / 'module/build/test-results/headlessTest/binary').exists())
 
     def test_complete_raw_nested_assets_and_skip_counts(self):
         result, values, summary = self.collect()

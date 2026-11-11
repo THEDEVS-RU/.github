@@ -22,8 +22,8 @@ class Unsafe(ValueError):
 
 def safe_display(value):
     value = re.sub(r'[\x00-\x1f\x7f]', '', str(value))[:180]
-    escaped = html.escape(value, quote=True).replace('::', '&#58;&#58;')
-    return ''.join('&#' + str(ord(char)) + ';' if char in '\\`*_[]()#!+-.|' else char for char in escaped)
+    # Encode source characters once, so entities generated for HTML are never re-escaped.
+    return ''.join('&#' + str(ord(char)) + ';' if char in "&<>\"'\\`*_[]()#!+-.|:" else char for char in value)
 
 
 def relative_path(value):
@@ -198,7 +198,7 @@ def collect(env):
                 raise Unsafe('report root is not directory')
             for relative in report_entries(checkout, root):
                     candidate = checkout / relative
-                    if '/test-results/' in str(relative) and 'binary' in relative.parts and candidate.name in {'output.bin', 'output.bin.idx', 'results.bin'}:
+                    if '/test-results/' in str(relative) and 'binary' in relative.parts and candidate.name in {'output.bin', 'output.bin.idx', 'results.bin', 'results-generic.bin', 'output-events.bin'}:
                         continue
                     permitted_file(candidate)
                     # Scan across chunk boundaries without printing contents or the matched value.
@@ -296,7 +296,7 @@ def collect(env):
                     errors.append('incomplete task')
                 if task.get('state') in {'success', 'failure'} and sum(task_counts.values()) == 0:
                     errors.append('executed-empty task')
-                task['reportCounts'] = dict(task_counts)
+                task['reportCounts'] = {key: task_counts[key] for key in ('passed', 'failed', 'skipped')}
                 task['distinctClasses'] = len(classes)
                 task['cacheStatisticsByReport'] = caches
                 cache_observations = {}
@@ -329,7 +329,7 @@ def collect(env):
         errors.append('malformed or unreadable report metadata/XML')
     if unsafe:
         tasks = []; counts.clear(); manifest = {}
-    status = {'schemaVersion': 1, 'testOutcome': env.get('REPORT_TEST_OUTCOME', 'unknown'), 'complete': not errors, 'errors': sorted(set(errors)), 'tasks': tasks, 'counts': dict(counts), 'fileCount': len(files), 'bytes': sum(p.stat().st_size for p in files.values())}
+    status = {'schemaVersion': 1, 'testOutcome': env.get('REPORT_TEST_OUTCOME', 'unknown'), 'complete': not errors, 'errors': sorted(set(errors)), 'tasks': tasks, 'counts': {key: counts[key] for key in ('passed', 'failed', 'skipped')} if tasks else None, 'fileCount': len(files), 'bytes': sum(p.stat().st_size for p in files.values())}
     if not unsafe:
         (staging / 'collection-status.json').write_text(json.dumps(status, sort_keys=True))
     else:
