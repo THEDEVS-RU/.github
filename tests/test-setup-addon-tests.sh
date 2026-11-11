@@ -1771,3 +1771,22 @@ test -f "$OBSERVATION_SCRIPT"
 grep -q 'default: '\''false'\''' "${SCRIPT_DIR}/../actions/setup-addon-tests/action.yml"
 grep -q 'THEDEVS_ADDON_TESTS_OBSERVABILITY_INIT' "${SCRIPT_DIR}/../actions/setup-addon-tests/action.yml"
 grep -q "state: 'scheduled'" "$OBSERVATION_SCRIPT"
+
+# TD-2844: repeat the existing downstream fixture with observation enabled, retaining
+# all original scenarios above unchanged. A fresh source copy forces real execution.
+OBSERVED_DIR="$TEST_DIR/observed-consumer"
+python3 - "$DOWNSTREAM_DIR" "$OBSERVED_DIR" <<'PY'
+import shutil, sys
+shutil.copytree(sys.argv[1], sys.argv[2], ignore=shutil.ignore_patterns('build', '.gradle'))
+PY
+cat >> "$OBSERVED_DIR/consumer-mod/build.gradle" <<'EOF_OBSERVATION'
+// Add only the existing pre-rollout fixture; original dependency graph is retained.
+dependencies { implementation 'ru.thedevs:sample-lib:1.0.0' }
+EOF_OBSERVATION
+(
+  cd "$OBSERVED_DIR"
+  THEDEVS_TEST_LANE=dependencies THEDEVS_ADDON_TESTS_OBSERVABILITY_INIT="$OBSERVATION_SCRIPT" \
+    gradle -I "$INIT_SCRIPT" -I "$OBSERVATION_SCRIPT" :consumer-mod:testAddonDependencies --no-daemon
+)
+python3 "$SCRIPT_DIR/verify-addon-observation.py" "$DOWNSTREAM_DIR" "$OBSERVED_DIR" "$REPO_DIR" "$DOWNSTREAM_LOG"
+echo "=== TD-2844 opt-in observation preserves TD-2039 candidates, states, checksums and test identities ==="

@@ -68,6 +68,36 @@ class Reports(unittest.TestCase):
             self.assertEqual(strict == 'true', 'THEDEVS_TESTS_STRICT=true' in environment.read_text())
             self.assertIn('THEDEVS_ADDON_TESTS_INIT=', environment.read_text())
 
+    def test_executed_html_requires_index_and_referenced_assets(self):
+        index = self.checkout / 'module/build/reports/tests/headlessTest/index.html'
+        index.unlink()
+        self.assertEqual('false', self.collect()[1]['complete'])
+        index.write_text('<html><link href="css/missing.css"></html>')
+        self.assertEqual('false', self.collect()[1]['complete'])
+        self.write('module/build/reports/tests/headlessTest/css/missing.css', 'body{}')
+        self.assertEqual('true', self.collect()[1]['complete'])
+        index.write_text('<html><img src="../../../../outside.png"></html>')
+        self.assertEqual('false', self.collect()[1]['ready'])
+
+    def test_profile_referenced_assets_required(self):
+        self.write('build/reports/profile/profile.html', '<html><script src="js/profile.js"></script></html>')
+        self.assertEqual('false', self.collect()[1]['complete'])
+        self.write('build/reports/profile/js/profile.js', 'const profile = 1;')
+        self.assertEqual('true', self.collect()[1]['complete'])
+
+    def test_failure_with_non_xml_output_is_incomplete(self):
+        (self.checkout / 'module/build/test-results/headlessTest/TEST-a.xml').unlink()
+        self.write('module/build/test-results/headlessTest/status.json', '{}')
+        self.task.update(state='failure', counts=None); self.manifest()
+        self.env['REPORT_TEST_OUTCOME'] = 'failure'
+        self.assertEqual('false', self.collect()[1]['complete'])
+
+    def test_credential_and_environment_names_rejected_without_values(self):
+        for name in ('credentials.json', 'kubeconfig.xml', 'environment.json', 'system-properties.json'):
+            path = self.write('module/build/reports/tests/headlessTest/' + name, '{}')
+            self.assertEqual('false', self.collect()[1]['ready'])
+            path.unlink()
+
     def test_binary_outputs_are_never_staged(self):
         self.write('module/build/test-results/headlessTest/binary/output.bin', 'binary')
         result, values, _ = self.collect()
